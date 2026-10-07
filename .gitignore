@@ -1,0 +1,6 @@
+.serena/
+__pycache__/
+*.pyc
+.DS_Store
+reports/
+experiment-data/

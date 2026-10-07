@@ -1,0 +1,2170 @@
+#!/usr/bin/env python3
+"""Interactive console util to toggle macOS launchd services on/off.
+
+Shows current disabled state, lets you flip checkboxes, applies diff with sudo
+on Enter.
+
+The top rows are a preset menu — enter on one applies it right away. Below
+that the Spotlight file index, then every launchd service. `[✓]` means on,
+`[ ]` means off, `*` marks a row that changes on enter, and a spinner marks
+a row the system has not finished settling into (Spotlight rebuilding).
+
+Keys:
+  ↑/↓ or j/k   move
+  PgUp/PgDn    jump 10
+  [/]          jump to prev/next section
+  space        toggle current row
+  enter        on a menu row apply that preset, otherwise apply the ticked
+               changes (prompts sudo)
+  r            reload state from system
+  q            quit
+"""
+from __future__ import annotations
+
+import curses
+import glob
+import json
+import os
+import pwd
+from datetime import datetime
+import re
+import subprocess
+import sys
+import textwrap
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+UID = int(os.environ.get("SUDO_UID", os.getuid()))
+DOMAINS = ("system", f"gui/{UID}")
+BACKUP_DIR = Path(pwd.getpwuid(UID).pw_dir) / "Library/Application Support/macos-debloat-zh"
+PERSIST_LABEL = "io.github.nextwa.macos-debloat-zh"
+PERSIST_PLIST = Path(f"/Library/LaunchDaemons/{PERSIST_LABEL}.plist")
+PERSIST_DIR = Path("/Library/Application Support/macos-debloat-zh")
+PERSIST_STATE = PERSIST_DIR / "persist.json"
+PERSIST_REPORT = PERSIST_DIR / "last-run.json"
+PERSIST_PASSES = 5
+PERSIST_PASS_S = 60
+PERSIST_WATCH_S = 300
+PERSIST_REPORT_PASSES = 20
+
+LAUNCHD_DIRS = (
+    "/System/Library/LaunchDaemons",
+    "/System/Library/LaunchAgents",
+    "/System/Cryptexes/App/System/Library/LaunchDaemons",
+    "/System/Cryptexes/App/System/Library/LaunchAgents",
+    "/Library/Apple/System/Library/LaunchDaemons",
+    "/Library/Apple/System/Library/LaunchAgents",
+)
+
+EMBEDDED_LABELS = """\
+# Format: label  # comment (what breaks if disabled)
+# Lines starting with `# ===` are section headers.
+
+# === Spotlight / app launcher ===
+# On 27, Siri AI.app (campo) hosts Cmd-Space and the four-finger Apps pinch.
+# That is how you launch apps — not an AI extra. Not in balanced; --disable-all
+# still reaches it if you have another launcher.
+com.apple.campo                               # Cmd-Space + four-finger Apps pinch (Spotlight UI). Leave on to launch apps the usual way.
+
+# === Siri / voice assistant [balanced] ===
+com.apple.siriappintentsd                     # Siri App Intents orchestrator
+com.apple.assistant_service                   # Siri execution / flow XPC
+com.apple.assistantd [sip-off]                # Siri core
+com.apple.Siri.agent                          # Siri agent
+com.apple.SiriTTSTrainingAgent                # Siri voice training
+com.apple.sirittsd [sip-off]                  # Siri TTS daemon
+com.apple.siriinferenced [sip-off]            # on-device Siri inference
+com.apple.siriknowledged [sip-off]            # Siri knowledge graph
+com.apple.assistant_cdmd [sip-off]            # Siri continuous dialog manager
+com.apple.parsecd [sip-off]                   # Siri/Spotlight suggestions backend
+com.apple.parsec-fbf [sip-off]                # Siri Suggestions feedback
+com.apple.intelligencecontextd                # Apple Intelligence context runtime
+com.apple.intelligenceplatformd [sip-off]     # Apple Intelligence platform
+com.apple.knowledge-agent [sip-off]           # knowledge graph extraction
+
+# === Apple Intelligence (Tahoe) [balanced] ===
+com.apple.mlruntimed                          # runtime for Apple's distributed (federated) ML model evaluation
+com.apple.generativeexperiencesd [sip-off]    # Writing Tools / generative AI
+com.apple.privatecloudcomputed [sip-off]      # Private Cloud Compute (AI cloud offload)
+com.apple.modelcatalogd [sip-off]             # AI model catalog daemon
+com.apple.ModelCatalogAgent [sip-off]         # AI model catalog agent
+com.apple.modelmanagerd [sip-off]             # AI model manager / downloads
+com.apple.naturallanguaged                    # NaturalLanguage framework daemon
+com.apple.textunderstandingd                  # text understanding AI
+com.apple.triald [sip-off]                    # Trial: Apple's A/B experiments and feature / asset rollouts (all apps, not only Siri)
+com.apple.triald.system [sip-off]             # Trial, system side: experiments and asset rollouts for system daemons
+com.apple.visualintelligenced                 # Visual Intelligence (screenshot / camera AI)
+com.apple.GenerativeFunctions.agentstored     # Apple Intelligence agent session store
+com.apple.contextstored [sip-off]             # context store (KNOWN >30GB MEMORY LEAK in Tahoe)
+
+# === Telemetry / analytics [telemetry] ===
+com.apple.analyticsd [sip-off]                # Apple diagnostics submission
+com.apple.tipsd [sip-off]                     # Tips app notifications
+
+# === AirDrop / Continuity (no iPhone) [balanced] ===
+com.apple.sharingd [sip-off]                  # AirDrop / Handoff / share sheet (~60 MB resident)
+com.apple.rapportd [sip-off]                  # device proximity / Continuity discovery
+
+# === Diagnostics / crash reports [telemetry] ===
+com.apple.ReportCrash                         # auto crash report generator
+com.apple.spindump [sip-off]                  # hang detection / spin reports
+
+# === Apple ads [telemetry] ===
+com.apple.ap.adprivacyd [sip-off]             # ad privacy
+com.apple.ap.promotedcontentd [sip-off]       # promoted apps
+
+# === Proactive / predictive [balanced] ===
+com.apple.coreduetd [sip-off]                 # activity tracker for proactive features
+com.apple.duetexpertd [sip-off]               # prediction engine
+com.apple.suggestd [sip-off]                  # Spotlight smart suggestions backend
+com.apple.biomesyncd [sip-off]                # biome event sync
+com.apple.navd                                # time-to-leave / commute predictions
+com.apple.ospredictiond [sip-off]             # OS behavior predictions
+com.apple.milod [sip-off]                     # MicroLocation: learns places and rooms of interest for location-based suggestions
+
+# === Game Center / AirPlay receiver ===
+com.apple.gamed                               # Game Center
+com.apple.AirPlayXPCHelper [sip-off]          # AirPlay helper
+
+# === Photos analysis ===
+com.apple.photoanalysisd [sip-off]            # face/scene/object scan in Photos
+com.apple.mediaanalysisd [sip-off]            # media library indexing
+
+# === News / Stocks / Weather [balanced] ===
+com.apple.weatherd [sip-off]                  # weather data daemon (menu bar / widgets)
+com.apple.newsd                               # News app daemon
+
+# === Apple ID nags / Family [balanced] ===
+com.apple.familycircled [sip-off]             # Family Sharing
+com.apple.followupd [sip-off]                 # Apple ID setup nags
+
+# === Misc [balanced] ===
+com.apple.helpd [sip-off]                     # Help viewer indexer
+com.apple.ndoagent                            # AppleCare / new-device outreach nags
+
+# === iMessage / FaceTime / phone relay (no iPhone) [balanced] ===
+com.apple.imagent [sip-off]                   # iMessage agent
+com.apple.telephonyutilities.callservicesd [sip-off] # phone call relay from iPhone
+com.apple.imautomatichistorydeletionagent     # iMessage history cleanup
+com.apple.imcore.imtransferagent [sip-off]    # iMessage attachments
+com.apple.nearbyd [sip-off]                   # Continuity Nearby (AirDrop/Handoff discovery)
+com.apple.callhistoryd                        # iPhone call history sync
+com.apple.CallHistoryPluginHelper             # call history plugin
+com.apple.CallHistorySyncHelper               # call history iCloud sync
+com.apple.businessservicesd                   # Apple Business Chat
+
+# === HomeKit ===
+com.apple.homed [sip-off]                     # HomeKit daemon
+com.apple.homeeventsd [sip-off]               # HomeKit events
+com.apple.threadradiod                        # Thread radio (Matter/HomeKit)
+com.apple.ThreadCommissionerService [sip-off] # Matter device commissioning
+
+# === Apple Mail/Calendar/Contacts/Reminders (use Gmail/web instead) ===
+com.apple.contactsd                           # Contacts sync
+com.apple.calaccessd [sip-off]                # Calendar backend
+com.apple.remindd [sip-off]                   # Reminders
+com.apple.dataaccess.dataaccessd              # Exchange/CardDAV/CalDAV sync
+com.apple.email.maild [sip-off]               # Mail daemon
+
+# === Speech / dictation [balanced] ===
+com.apple.speech.speechsynthesisd.arm64       # text-to-speech (native Apple Silicon)
+com.apple.speech.speechsynthesisd.x86_64      # text-to-speech (Intel / Rosetta)
+com.apple.speech.speechdatainstallerd         # voice data installer
+com.apple.speechmaintenanced                  # on-device speech model maintenance
+
+# === Wallpaper / thumbnails [balanced] ===
+com.apple.quicklook.ThumbnailsAgent           # QuickLook thumbnails in Finder
+
+# === App Store + update nags (keeps softwareupdated for security) [balanced] ===
+com.apple.SoftwareUpdateNotificationManager [sip-off] # update nag popups
+com.apple.amsengagementd [sip-off]            # Apple Media Services engagement
+
+# === Misc dead weight [balanced] ===
+com.apple.studentd                            # Schoolwork app
+com.apple.linkd [sip-off]                     # App Intents runtime: app actions for Shortcuts, Siri and Spotlight — Shortcuts' app actions stop
+com.apple.liveactivitiesd [sip-off]           # Live Activities widgets
+
+# === iCloud (no iCloud use) ===
+com.apple.cloudd [sip-off]                    # iCloud sync core
+com.apple.cloudphotod [sip-off]               # iCloud Photos sync
+com.apple.icloudwebd                          # iCloud.com / iCloud on the web
+
+# === Location/prediction extras (Find My still intact) [balanced] ===
+com.apple.routined [sip-off]                  # significant locations / location-aware reminders
+com.apple.homeenergyd [sip-off]               # Home Energy widget
+
+# === Time Machine ===
+com.apple.backupd [sip-off]                   # Time Machine core backup daemon
+com.apple.TMHelperAgent                       # Time Machine menu / reminders
+com.apple.backupd-helper [sip-off]            # Time Machine scheduling helper
+
+# === Focus / DND / Screen Time ===
+com.apple.donotdisturbd [sip-off]             # Focus modes / Do Not Disturb
+com.apple.ScreenTimeAgent [sip-off]           # Screen Time
+com.apple.ScreenTimeSettingsAgent             # Screen Time settings UI agent
+com.apple.ManagedSettingsAgent [sip-off]      # Screen Time app limits
+com.apple.UsageTrackingAgent [sip-off]        # device usage tracking (Screen Time data)
+com.apple.StatusKitAgent [sip-off]            # share Focus status (iMessage)
+
+# === Apple Media Services / iPhone telephony / contacts [balanced] ===
+com.apple.CommCenter [sip-off]                # iPhone cellular call relay (no iPhone)
+com.apple.contacts.postersyncd                # Contacts profile picture sync
+
+# === More AI/ML stragglers [balanced] ===
+com.apple.mlhostd [sip-off]                   # on-device ML training host (Lighthouse)
+
+# === Cosmetic / app daemons [balanced] ===
+com.apple.powerchime                          # laptop charging chime sound
+com.apple.talagent [sip-off]                  # app relaunch / window restore at login
+com.apple.shazamd [sip-off]                   # Shazam music recognition (Control Center)
+
+# === Safari (no Safari use) ===
+com.apple.Safari.SafeBrowsing.Service [sip-off] # Safari Safe Browsing list updates
+com.apple.SafariBookmarksSyncAgent [sip-off]  # Safari bookmarks iCloud sync
+com.apple.SafariLaunchAgent                   # Safari startup agent
+
+# === More AI / Apple Intelligence [balanced] ===
+com.apple.siriactionsd [sip-off]              # Siri Shortcuts/Voice Shortcuts agent
+com.apple.ContextStoreAgent [sip-off]         # CoreDuet ContextStoreAgent
+com.apple.corespeechd [sip-off]               # Core Speech backbone (Siri/dictation)
+com.apple.corespeechd_system [sip-off]        # Core Speech system variant
+com.apple.speech.synthesisserver              # speech synthesis server
+com.apple.spotlightknowledged                 # CoreSpotlight semantic search
+com.apple.spotlightknowledged.importer        # CoreSpotlight importer
+com.apple.spotlightknowledged.updater [sip-off] # CoreSpotlight updater
+com.apple.callintelligenced                   # AI call analysis (call summaries)
+com.apple.intelligenceflowd [sip-off]         # AI flow daemon
+com.apple.intelligencetasksd                  # AI tasks daemon
+com.apple.synapse.contentlinkingd             # Notes / Safari content links (backlinks)
+com.apple.LinkedNotesUIService                # Notes backlink indicator UI (~26 MB)
+
+# === Spotlight KeepAlive daemons (mdutil -d leaves these resident) [macos>=27] ===
+# Not in telemetry/balanced. On Tahoe 26, launchctl on corespotlightd broke
+# typed Cmd-Space. These rows are indexer KeepAlive after mdutil -d, not the
+# overlay: on 27 Cmd-Space / the four-finger Apps pinch is com.apple.campo
+# (Siri AI.app). Do not list com.apple.Spotlight here — that is the old
+# overlay host, already feature-flagged off when campo is the UI.
+com.apple.metadata.mds                        # Spotlight server (KeepAlive); off, new files are not indexed
+com.apple.metadata.mds.index                  # Spotlight index helper; off, new files are not indexed
+com.apple.metadata.mds.scan                   # Spotlight scan helper
+com.apple.msrpc.mdssvc                        # Spotlight SMB/network metadata
+com.apple.corespotlightd                      # CoreSpotlight daemon
+com.apple.corespotlightservice                # CoreSpotlight service
+com.apple.managedcorespotlightd               # managed CoreSpotlight
+com.apple.metadata.mdbulkimport               # Spotlight ingest worker
+com.apple.metadata.mdflagwriter               # Spotlight flag writer
+com.apple.metadata.mdwrite                    # Spotlight metadata writer
+
+# === Apple Music / iTunes / Media streaming ===
+com.apple.itunescloudd [sip-off]              # Apple Music / iTunes Match cloud
+com.apple.musicd                              # Apple Music local daemon
+com.apple.amp.mediasharingd                   # Apple Music sharing
+com.apple.mediastream.mstreamd                # iCloud media stream
+com.apple.mediacontinuityd                    # media Continuity (no iPhone)
+com.apple.mediaremoted [sip-off]              # media keys / now-playing
+com.apple.mediaremoteagent [sip-off]          # media remote agent
+
+# === Apple ID / Apple Pay / SSO ===
+com.apple.appleaccountd [sip-off]             # Apple ID account daemon
+com.apple.passd                               # Wallet / Apple Pay
+com.apple.AppSSODaemon                        # Apple SSO Daemon
+com.apple.financed [sip-off]                  # Wallet / Apple Card finance data
+com.apple.adid [sip-off]                      # Apple Device Identity (CoreADI) — iCloud auth, not ads
+com.apple.identityservicesd [sip-off]         # Apple ID identity (iMessage/FaceTime)
+com.apple.AppSSOAgent                         # Apple SSO extensions
+com.apple.cdpd [sip-off]                      # iCloud account recovery and keychain escrow (recovery contacts, iCloud Keychain)
+
+# === App Store full kill (re-enable when needed) ===
+com.apple.appstored                           # App Store daemon
+com.apple.appstorecomponentsd                 # App Store components
+com.apple.commerce [sip-off]                  # App Store commerce / purchases
+com.apple.storeaccountd                       # App Store account
+com.apple.storeassetd                         # App Store assets
+com.apple.storedownloadd                      # App Store downloads
+com.apple.storekitagent                       # StoreKit purchases
+com.apple.storelegacy                         # legacy iTunes Store
+com.apple.storereceiptinstaller               # app receipt installer
+com.apple.storeuid                            # App Store UI daemon
+com.apple.appplaceholdersyncd [sip-off]       # app placeholder sync
+com.apple.appstoreagent [sip-off]             # App Store agent
+com.apple.amsaccountsd [sip-off]              # Apple Media Services account state
+com.apple.amsondevicestoraged [sip-off]       # App Store on-device storage scan
+
+# === iCloud user-facing notifications [balanced] ===
+com.apple.iCloudNotificationAgent [sip-off]   # iCloud notification UI
+com.apple.iCloudUserNotificationsd            # iCloud user notifications
+com.apple.icloudmailagent                     # iCloud Mail (no Apple Mail)
+com.apple.FollowUpUI                          # Apple ID nag UI
+
+# === Apple Books (no Books use) ===
+com.apple.bookassetd                          # Apple Books asset downloads
+com.apple.bookdatastored                      # Apple Books data store
+
+# === Telemetry extras [telemetry] ===
+com.apple.geoanalyticsd [sip-off]             # Geo telemetry
+com.apple.SubmitDiagInfo [sip-off]            # diagnostic submitter to Apple
+com.apple.BiomeAgent [sip-off]                # biome event hub agent
+com.apple.biomed [sip-off]                    # biome event hub daemon
+
+# === Contacts/Photos extras ===
+com.apple.contacts.donation-agent [sip-off]   # Contacts → Siri Suggestions feed
+com.apple.photolibraryd [sip-off]             # Photos library daemon
+
+# === Filesystem / cosmetic [balanced] ===
+com.apple.filesystems.fskitd                  # File System Kit core (3rd-party FS plugins)
+com.apple.fskit.fskit_agent                   # FSKit agent
+com.apple.fskit.fskit_helper                  # FSKit helper
+com.apple.chronod [sip-off]                   # widget host (widgets gone, demand-loaded by NC)
+
+# === Contacts / AddressBook (no Mac Contacts use) ===
+com.apple.AddressBook.AssistantService        # Contacts assistant
+com.apple.AddressBook.SourceSync              # Contacts source sync
+com.apple.AddressBook.abd                     # Contacts daemon
+com.apple.peopled                             # People: contact-based person actions (FaceTime, Calendar people)
+
+# === Audio route suggestions ===
+com.apple.intelligentroutingd                 # suggests audio / AirPlay output routes (one-tap route picker) — not Maps
+
+# === Maps (Google Maps user) ===
+com.apple.Maps.mapssyncd [sip-off]            # Apple Maps sync
+com.apple.Maps.mapspushd                      # Apple Maps push
+com.apple.maps.destinationd                   # Apple Maps destinations
+
+# === Beta program enrollment (not on macOS beta) [telemetry] ===
+com.apple.appleseed.fbahelperd                # AppleSeed feedback assistant helper
+com.apple.appleseed.seedusaged                # AppleSeed usage telemetry
+com.apple.appleseed.seedusaged.postinstall    # AppleSeed postinstall
+com.apple.betaenrollmentagent                 # beta enrollment agent
+com.apple.betaenrollmentd                     # beta enrollment daemon
+com.apple.feedbackd [sip-off]                 # Feedback Assistant daemon
+
+# === Game controllers (no gamepad attached) ===
+com.apple.GameController.gamecontrolleragentd # game controller agent
+com.apple.GameController.gamecontrollerd      # game controller daemon
+com.apple.GamePolicyAgent [sip-off]           # game policy agent
+com.apple.gamepolicyd [sip-off]               # game policy daemon
+com.apple.gamesaved                           # game saves
+
+# === Sidecar / iPad second display (no iPad) [balanced] ===
+com.apple.sidecar-display-agent               # Sidecar display agent
+com.apple.sidecar-relay                       # Sidecar relay
+
+# === Continuity Capture (no iPhone webcam) [balanced] ===
+com.apple.cmio.ContinuityCaptureAgent [sip-off] # iPhone as webcam agent
+com.apple.companiond                          # Apple Watch / iPhone companion
+
+# === Avatar / Memoji / Stickers (no iMessage) [balanced] ===
+com.apple.avatarsd                            # Memoji / avatars
+com.apple.stickersd                           # iMessage stickers
+
+# === Safari extras (no Safari + no iCloud Keychain) ===
+com.apple.Safari.History                      # Safari history
+com.apple.Safari.PasswordBreachAgent          # password leak checker (needs iCloud Keychain)
+com.apple.SafariHistoryServiceAgent           # Safari history XPC
+com.apple.SafariNotificationAgent             # Safari web notifications
+
+# === Family / Parental controls (no family setup) [balanced] ===
+com.apple.familycontrols                      # family controls daemon
+com.apple.familycontrols.useragent            # family controls user agent
+com.apple.FamilyControlsAgent                 # family controls agent
+com.apple.familynotificationd                 # family notifications
+com.apple.parentalcontrols.check              # parental controls checker
+com.apple.askpermissiond                      # family purchase approval (Ask to Buy)
+com.apple.assessmentagent [sip-off]           # education assessment mode
+com.apple.progressd                           # ClassKit education progress
+
+# === Proactive / Siri-adjacent (no Siri) [balanced] ===
+com.apple.proactived                          # proactive engine
+com.apple.proactiveeventtrackerd              # proactive event tracker
+com.apple.knowledgeconstructiond              # knowledge graph construction
+com.apple.reversetemplated                    # reverse template AI
+
+# === AirPlay sender UI [balanced] ===
+com.apple.AirPlayUIAgent [sip-off]            # AirPlay sender UI (sending to Apple TV)
+
+# === Sports / News extras [balanced] ===
+com.apple.sportsd                             # Apple Sports data
+
+# === Apple FairPlay DRM (no DRM-protected Apple content) ===
+com.apple.fairplayd                           # FairPlay DRM
+com.apple.fairplaydeviceidentityd             # FairPlay device identity
+
+# === Diagnostics extras (all telemetry to Apple) [telemetry] ===
+com.apple.diagnosticd                         # diagnostics
+com.apple.diagnosticextensionsd [sip-off]     # diagnostic extensions
+com.apple.diagnostics_agent [sip-off]         # diagnostics agent
+com.apple.diagnosticservicesd                 # diagnostic services
+com.apple.diagnosticspushd                    # diagnostic push
+com.apple.metrickitd                          # MetricKit (app metrics to Apple)
+com.apple.osanalytics.osanalyticshelper [sip-off] # OS analytics helper
+com.apple.spindump_agent                      # spindump agent (process hangs)
+com.apple.metadata.mds.spindump               # Spotlight spindump diagnostic
+com.apple.diagnosticextensions.osx.spotlight.helper  # Spotlight diagnostic extension
+com.apple.audioanalyticsd [sip-off]           # audio analytics
+com.apple.inputanalyticsd [sip-off]           # input analytics (typing/touch)
+com.apple.ecosystemanalyticsd                 # ecosystem analytics
+com.apple.analyticsagent [sip-off]            # analytics agent
+com.apple.CrashReporterSupportHelper [sip-off] # crash reporter support
+com.apple.DiagnosticsReporter                 # diagnostics reporter
+com.apple.InstallerDiagnostics.installerdiagd # installer diagnostics
+com.apple.InstallerDiagnostics.installerdiagwatcher  # installer diag watcher
+com.apple.loginwindow.LWWeeklyMessageTracer   # weekly login telemetry
+com.apple.symptomsd-diag [sip-off]            # symptoms diag (keep core symptomsd)
+com.apple.symptomsd.distributed-agent         # symptoms distributed agent
+com.apple.rtcreportingd [sip-off]             # FaceTime/WebRTC call quality reports
+com.apple.securityuploadd                     # security telemetry upload
+com.apple.usbctelemetryd                      # USB-C port telemetry
+com.apple.systemstats.analysis [sip-off]      # system stats analysis
+com.apple.systemstats.daily                   # daily system stats
+com.apple.systemstats.microstackshot_periodic # periodic microstackshots
+com.apple.signpost.signpost_reporter          # signpost perf telemetry
+com.apple.enhancedloggingd                    # MDM enhanced logging
+
+# === Software update extras (keep softwareupdated + swcd) [balanced] ===
+com.apple.softwareupdate_firstrun_tasks       # one-shot first-boot SU tasks
+
+# === Misc Apple legacy / unused [balanced] ===
+com.apple.AOSPushRelay                        # legacy iCloud push relay
+com.apple.nfcd [sip-off]                      # NFC daemon (no Apple Pay)
+com.apple.facetimemessagestored               # FaceTime message store
+com.apple.calendar.CalendarAgentBookmarkMigrationService  # one-shot Cal bookmark migration
+
+# === Apple ID auth (kill — re-enable when needed for App Store) ===
+com.apple.akd [sip-off]                       # AuthKit (Apple ID) — re-enable when logging into App Store
+
+# === Apple Translate / Notes / VoiceOver / accessibility extras [balanced] ===
+com.apple.translationd                        # Apple Translate API (Translate app, Safari translate)
+com.apple.notes.exchangenotesd                # Apple Notes Exchange sync
+com.apple.VoiceOver                           # screen reader (no accessibility use)
+com.apple.accessibility.LiveTranscriptionAgent  # live transcription/captions
+com.apple.accessibility.axassetsd [sip-off]   # TTS voice + VoiceOver/Magnifier model asset downloads
+com.apple.DictationIM                         # dictation input method
+com.apple.voicebankingd [sip-off]             # custom voice creation (Live Speech)
+com.apple.voicememod                          # Voice Memos app
+
+# === iCloud settings / language assets ===
+com.apple.cloudsettingssyncagent              # iCloud settings sync
+com.apple.languageassetd                      # Apple language model assets (Siri/dictation/translate)
+com.apple.erasecontentsettingshelperd         # Erase All Content (only used for factory reset)
+
+# === Apple TV watchlist / social / WiFi telemetry [balanced] ===
+com.apple.watchlistd                          # Apple TV+ watchlist
+com.apple.sociallayerd [sip-off]              # Game Center social layer
+com.apple.wifianalyticsd [sip-off]            # WiFi telemetry
+
+# === T2 / bridgeOS ===
+# Same labels on T2 Intel and Apple Silicon. Disabling them breaks the
+# macOS Update install step on both. Not in balanced.
+com.apple.bridgeOSUpdateProxy                 # firmware/update proxy (T2 and Apple Silicon)
+com.apple.bosreporter                         # bridgeOS install reporting
+com.apple.boswatcher                          # bridgeOS install watcher (macOS Update installs)
+
+# === Battery / power logging (charge limiting needs these) ===
+com.apple.perfpowermetricd                    # perf/power metrics; off was reported to break charge limiting (macOS limiter, AlDente)
+com.apple.powerlogHelperd                     # battery usage logging (Settings battery graph); off was reported to break charge limiting
+
+# === Print (no printer) ===
+com.apple.printtool.agent                     # print tool agent
+com.apple.printtool.daemon                    # print tool daemon
+com.apple.printuitool.agent                   # print UI tool agent
+
+# === Xcode / iOS dev stack (FE/BE dev, no mobile) [balanced] ===
+com.apple.previewsd                           # Xcode SwiftUI previews
+com.apple.dt.AutomationModeUI                 # Xcode automation UI
+com.apple.dt.automationmode-writer            # Xcode automation writer
+
+# === Apple Music Player (AMP) suite — no Apple Music ===
+com.apple.AMPArtworkAgent                     # album artwork
+com.apple.AMPDeviceDiscoveryAgent [sip-off]   # Apple Music device discovery (not AirPods BT)
+com.apple.AMPDevicesAgent                     # Apple Music devices agent
+com.apple.AMPLibraryAgent                     # Apple Music library
+com.apple.AMPSystemPlayerAgent                # system music player agent
+
+# === Apple TV+ / video subscriptions ===
+com.apple.videosubscriptionsd                 # Apple TV+ subscriptions
+
+# === Touch Bar (M4 has none) [balanced] ===
+com.apple.nowplayingtouchui                   # Touch Bar now-playing UI
+com.apple.touchbarserver                      # Touch Bar server
+com.apple.controlstrip                        # Touch Bar control strip
+com.apple.SpacesTouchBarAgent.app             # Touch Bar Spaces agent
+com.apple.accessibility.dfrhud                # Touch Bar accessibility HUD
+
+
+# === Safari Web Inspector / WebKit push (no Safari) ===
+com.apple.webinspectord                       # Safari Web Inspector
+com.apple.webkit.webpushd                     # WebKit push (Safari web notifications)
+
+
+# === iCloud Drive / Keychain Circle / SyncedDefaults / CloudDocs ===
+com.apple.bird [sip-off]                      # iCloud Drive sync daemon
+com.apple.security.keychain-circle-notification  # iCloud Keychain notification
+com.apple.syncdefaultsd [sip-off]             # iCloud synced defaults (app prefs)
+
+# === MDM / Managed apps (no MDM enrollment) [balanced] ===
+com.apple.managedappdistributionagent [sip-off] # managed app distribution agent
+com.apple.managedappdistributiond [sip-off]   # managed app distribution daemon
+
+
+# === Paired-device sync (Replicator) ===
+com.apple.replicatord [sip-off]               # syncs data with your paired devices (used by the widget host) — not Time Machine
+
+
+# === 🧠 Apple Intelligence / AI 全系 (macOS 15+) ===
+com.apple.intelligenceplatform  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.intelligencecontext  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.WritingTools  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.writingtoolsd  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.ImagePlayground  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.imageplaygroundd  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.Genmoji  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.genmojid  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.VisualIntelligence  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.mlhost  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.aiml  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.aimld  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.appintents  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.appintentsd  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.ondeviceintelligence  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.semanticindex  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.semanticindexd  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.contextengine  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.contextengined  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.personalsemanticunderstanding  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.privacypreservingml  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.federatedlearning  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.neuralengine  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.neuralengined  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.aimodeld  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+com.apple.generativeexperiences  # 🧠 Apple Intelligence / AI 全系 (macOS 15+)；仅处理本机实际存在的服务
+
+# === 🎙️ Siri 全系 ===
+com.apple.Siri  # 🎙️ Siri 全系；仅处理本机实际存在的服务
+com.apple.siri.embeddedspeech  # 🎙️ Siri 全系；仅处理本机实际存在的服务
+com.apple.siri-intelligence-platform  # 🎙️ Siri 全系；仅处理本机实际存在的服务
+com.apple.siri.context  # 🎙️ Siri 全系；仅处理本机实际存在的服务
+com.apple.knowledge-construction  # 🎙️ Siri 全系；仅处理本机实际存在的服务
+com.apple.sirianalyticsd  # 🎙️ Siri 全系；仅处理本机实际存在的服务
+
+# === 📱 iPhone Mirroring (macOS 15+) ===
+com.apple.iPhoneMirroring  # 📱 iPhone Mirroring (macOS 15+)；仅处理本机实际存在的服务
+com.apple.iphonemirroringd  # 📱 iPhone Mirroring (macOS 15+)；仅处理本机实际存在的服务
+com.apple.continuitydisplay  # 📱 iPhone Mirroring (macOS 15+)；仅处理本机实际存在的服务
+
+# === 📷 照片 & 媒体分析 ===
+com.apple.media-stream-client  # 📷 照片 & 媒体分析；仅处理本机实际存在的服务
+
+# === 📍 位置服务 ===
+com.apple.geod  # 📍 位置服务；仅处理本机实际存在的服务
+com.apple.locationmenu  # 📍 位置服务；仅处理本机实际存在的服务
+com.apple.CoreLocationAgent  # 📍 位置服务；仅处理本机实际存在的服务
+
+# === 🗺️ 地图 & 天气 ===
+com.apple.Maps.pushdaemon  # 🗺️ 地图 & 天气；仅处理本机实际存在的服务
+
+# === 📰 新闻 & 股票 & 体育 ===
+com.apple.newsinternetd  # 📰 新闻 & 股票 & 体育；仅处理本机实际存在的服务
+com.apple.stocks  # 📰 新闻 & 股票 & 体育；仅处理本机实际存在的服务
+com.apple.sports  # 📰 新闻 & 股票 & 体育；仅处理本机实际存在的服务
+
+# === ☁️ iCloud ===
+com.apple.nsurlsessiond  # ☁️ iCloud；仅处理本机实际存在的服务
+com.apple.nsurlstoraged  # ☁️ iCloud；仅处理本机实际存在的服务
+
+# === 💬 iMessage / FaceTime ===
+com.apple.imtransferagent  # 💬 iMessage / FaceTime；仅处理本机实际存在的服务
+com.apple.imdpersistenceagent  # 💬 iMessage / FaceTime；仅处理本机实际存在的服务
+com.apple.avconferenced  # 💬 iMessage / FaceTime；仅处理本机实际存在的服务
+
+# === 🌐 Safari 后台 ===
+com.apple.SafariCloudHistoryPushAgent  # 🌐 Safari 后台；仅处理本机实际存在的服务
+com.apple.WebKit.Networking  # 🌐 Safari 后台；仅处理本机实际存在的服务
+com.apple.WebKit.WebContent  # 🌐 Safari 后台；仅处理本机实际存在的服务
+com.apple.Safari.SandboxBroker  # 🌐 Safari 后台；仅处理本机实际存在的服务
+
+# === 🎵 Apple Music ===
+com.apple.iTunesHelper  # 🎵 Apple Music；仅处理本机实际存在的服务
+com.apple.iTunes  # 🎵 Apple Music；仅处理本机实际存在的服务
+
+# === 📡 AirDrop / Handoff ===
+com.apple.airplayd  # 📡 AirDrop / Handoff；仅处理本机实际存在的服务
+com.apple.sidecar  # 📡 AirDrop / Handoff；仅处理本机实际存在的服务
+
+# === 🔍 查找我的 ===
+com.apple.findmy  # 🔍 查找我的；仅处理本机实际存在的服务
+com.apple.icloud.findmydeviced  # 🔍 查找我的；仅处理本机实际存在的服务
+com.apple.icloud.fmfd  # 🔍 查找我的；仅处理本机实际存在的服务
+
+# === 📝 备忘 & 提醒 & 日记 ===
+com.apple.Notes  # 📝 备忘 & 提醒 & 日记；仅处理本机实际存在的服务
+com.apple.NotesMigrationService  # 📝 备忘 & 提醒 & 日记；仅处理本机实际存在的服务
+com.apple.journald  # 📝 备忘 & 提醒 & 日记；仅处理本机实际存在的服务
+com.apple.Journal  # 📝 备忘 & 提醒 & 日记；仅处理本机实际存在的服务
+
+# === 🛒 App Store 后台 ===
+com.apple.storebookkeeperd  # 🛒 App Store 后台；仅处理本机实际存在的服务
+com.apple.appstore  # 🛒 App Store 后台；仅处理本机实际存在的服务
+com.apple.softwareupdate_notify_agent  # 🛒 App Store 后台；仅处理本机实际存在的服务
+
+# === 🖼️ Quick Look ===
+com.apple.quicklook.ui.helper  # 🖼️ Quick Look；仅处理本机实际存在的服务
+com.apple.quicklook.QLThumbnail  # 🖼️ Quick Look；仅处理本机实际存在的服务
+
+# === 🐛 崩溃报告 ===
+com.apple.ReportGPURestart  # 🐛 崩溃报告；仅处理本机实际存在的服务
+com.apple.DiagnosticReportCleanup  # 🐛 崩溃报告；仅处理本机实际存在的服务
+com.apple.ProblemReporter  # 🐛 崩溃报告；仅处理本机实际存在的服务
+
+# === ⌨️ 语音 & 听写 ===
+com.apple.speech.speechsynthesisd  # ⌨️ 语音 & 听写；仅处理本机实际存在的服务
+com.apple.TextInputMenuAgent  # ⌨️ 语音 & 听写；仅处理本机实际存在的服务
+com.apple.Dictation  # ⌨️ 语音 & 听写；仅处理本机实际存在的服务
+com.apple.speech.voicebankingd  # ⌨️ 语音 & 听写；仅处理本机实际存在的服务
+
+# === 📇 通讯录/日历/邮件 ===
+com.apple.CalendarAgent  # 📇 通讯录/日历/邮件；仅处理本机实际存在的服务
+com.apple.Calendar  # 📇 通讯录/日历/邮件；仅处理本机实际存在的服务
+com.apple.mail  # 📇 通讯录/日历/邮件；仅处理本机实际存在的服务
+com.apple.MailServiceAgent  # 📇 通讯录/日历/邮件；仅处理本机实际存在的服务
+com.apple.MailCacheDelete  # 📇 通讯录/日历/邮件；仅处理本机实际存在的服务
+
+# === 🔑 密码 App (macOS 15+) ===
+com.apple.Passwords  # 🔑 密码 App (macOS 15+)；仅处理本机实际存在的服务
+com.apple.passwordsd  # 🔑 密码 App (macOS 15+)；仅处理本机实际存在的服务
+
+# === 👨‍👩‍👧 家长控制 ===
+com.apple.parentalcontrols  # 👨‍👩‍👧 家长控制；仅处理本机实际存在的服务
+com.apple.screentime  # 👨‍👩‍👧 家长控制；仅处理本机实际存在的服务
+
+# === 🔧 其他无用服务 ===
+com.apple.unmountassistant  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.wifi.WiFiAgent  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.AOSHeartbeat  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.watchdogd  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.Accessibility  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.universalaccessd  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.universalaccesscontrol  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.accessibility  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.ZoomWindow  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.beacond  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.proximitycontrol  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.wifip2pd  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.wifivelocityd  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.TrustEvaluationAgent  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.automatedDeviceEnrollment  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.invitesd  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.freeformd  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.healthd  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.Health  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.transparencyd  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.ESEServiceAgent  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.MobileSoftwareUpdate  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.OTATaskingAgent  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.backgroundassets.user  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.periodic-  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.weekly-  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.monthly-  # 🔧 其他无用服务；仅处理本机实际存在的服务
+com.apple.daily-  # 🔧 其他无用服务；仅处理本机实际存在的服务
+"""
+
+USER_LABELS_FILE = BACKUP_DIR / "labels.txt"
+# Embedded + USER_LABELS_FILE, counted by load_sections before the version and
+# absent-label drops remove rows. The TUI header cannot recount it afterwards.
+CATALOG_TOTAL = 0
+PRESETS_DIR = BACKUP_DIR / "presets"
+
+# AirDrop uses Wi-Fi, Bluetooth and account/contact identity. Application
+# search keeps the Spotlight UI, local index and LaunchServices.
+EXTREME_PRESET = "extreme-keep-airdrop-search"
+AIR_DROP_KEEP = {
+    "com.apple.sharingd", "com.apple.rapportd", "com.apple.nearbyd",
+    "com.apple.wifip2pd", "com.apple.wifi.WiFiAgent", "com.apple.bluetoothd",
+    "com.apple.bluetoothuserd", "com.apple.bluetoothUIServer", "com.apple.airportd",
+    "com.apple.identityservicesd", "com.apple.akd", "com.apple.accountsd",
+    "com.apple.contactsd", "com.apple.AddressBook.abd",
+    "com.apple.AddressBook.AssistantService", "com.apple.Siri.agent",
+}
+SEARCH_KEEP = {"com.apple.campo", "com.apple.Spotlight", "com.apple.lsd"}
+SEARCH_PREFIXES = ("com.apple.metadata.", "com.apple.mdworker",
+                   "com.apple.spotlight", "com.apple.corespotlight")
+CORE_KEEP = {
+    "com.apple.WindowServer", "com.apple.dock", "com.apple.Finder",
+    "com.apple.systemuiserver", "com.apple.loginwindow", "com.apple.controlcenter",
+    "com.apple.notificationcenterui", "com.apple.securityd", "com.apple.authd",
+    "com.apple.trustd", "com.apple.tccd", "com.apple.syspolicyd",
+    "com.apple.mDNSResponder", "com.apple.networkd", "com.apple.configd",
+    "com.apple.coreaudiod", "com.apple.audio.coreaudiod", "com.apple.bluetoothaudiod",
+    "com.apple.powerd", "com.apple.displaypolicyd", "com.apple.thermalmonitord",
+    "com.apple.watchdogd", "com.apple.coreservicesd", "com.apple.cfprefsd",
+    "com.apple.distnoted", "com.apple.pboard", "com.apple.timed",
+    "com.apple.universalaccessd", "com.apple.universalaccesscontrol",
+    "com.apple.TextInputMenuAgent", "com.apple.TrustEvaluationAgent",
+}
+
+
+def preserve_reason(label: str) -> str:
+    if label in AIR_DROP_KEEP:
+        return "AirDrop 及联系人身份识别"
+    if label in SEARCH_KEEP or label.startswith(SEARCH_PREFIXES):
+        return "应用搜索与本地索引"
+    if label in CORE_KEEP:
+        return "系统基础服务"
+    return ""
+
+
+BUILTIN_PRESETS = {
+    EXTREME_PRESET: (),
+    "telemetry": ("telemetry",),
+    "balanced": ("telemetry", "balanced"),
+}
+
+
+@dataclass
+class Item:
+    label: str
+    comment: str
+    section: str
+    disabled: bool = False
+    selected: bool = False
+    domains: set[str] = field(default_factory=set)
+    action: str = ""
+    state: str = ""
+    is_sip_off_required: bool = False
+    is_locked: bool = False
+
+
+@dataclass
+class Section:
+    title: str
+    preset: str = ""
+    macos: str = ""
+    items: list[Item] = field(default_factory=list)
+
+
+def macos_matches(spec: str, major: int | None) -> bool:
+    """Whether this macOS major version satisfies a catalog gate like '>=27'."""
+    if not spec or major is None:
+        return True
+    s = spec[5:] if spec.startswith("macos") else spec
+    m = re.match(r"^(>=|<=|==|>|<)(\d+)$", s)
+    if not m:
+        return True
+    op, n = m.group(1), int(m.group(2))
+    return {">=": major >= n, "<=": major <= n, "==": major == n,
+            ">": major > n, "<": major < n}[op]
+
+
+def parse_section_header(raw_title: str) -> Section:
+    """Trailing [balanced] / [macos>=27] tags; remainder is the section title."""
+    preset = ""
+    macos = ""
+    title = raw_title
+    while True:
+        tag = re.search(r"\s*\[([^\]]+)\]\s*$", title)
+        if not tag:
+            break
+        token = tag.group(1)
+        title = title[:tag.start()].rstrip()
+        if token in BUILTIN_PRESETS:
+            preset = token
+        elif token.startswith("macos"):
+            macos = token[len("macos"):]
+        elif re.match(r"^(>=|<=|==|>|<)\d+$", token):
+            macos = token
+    return Section(title=title, preset=preset, macos=macos)
+
+
+SIP_OFF_TAG = "[sip-off]"
+
+
+def parse_labels(source: Path | str) -> list[Section]:
+    text = source.read_text() if isinstance(source, Path) else source
+    sections: list[Section] = []
+    current = Section(title="(uncategorized)")
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        m = re.match(r"^#\s*===\s*(.+?)\s*===\s*$", line)
+        if m:
+            if current.items:
+                sections.append(current)
+            current = parse_section_header(m.group(1))
+            continue
+        if line.lstrip().startswith("#"):
+            continue
+        if "#" in line:
+            label_part, comment = line.split("#", 1)
+            label = label_part.strip()
+            comment = comment.strip()
+        else:
+            label = line.strip()
+            comment = ""
+        is_sip_off_required = label.endswith(SIP_OFF_TAG)
+        if is_sip_off_required:
+            label = label[:-len(SIP_OFF_TAG)].strip()
+        if label:
+            current.items.append(Item(label=label, comment=comment, section=current.title,
+                                      is_sip_off_required=is_sip_off_required))
+    if current.items:
+        sections.append(current)
+    return sections
+
+
+@dataclass(frozen=True)
+class CatalogStats:
+    """Sizes of a parsed catalog. Always counted from labels, never a literal."""
+    total: int
+    sections: int
+    telemetry: int
+    balanced: int
+
+    @property
+    def beyond_balanced(self) -> int:
+        return self.total - self.balanced
+
+
+def catalog_stats(sections: list[Section] | None = None) -> CatalogStats:
+    """Count labels and preset sizes from `EMBEDDED_LABELS` (or `sections`).
+
+    This is the only catalog-size API. Help, status, the TUI and docs sync
+    all read it so adding a label cannot leave a stale 270 sitting somewhere.
+    """
+    if sections is None:
+        sections = parse_labels(EMBEDDED_LABELS)
+    total = telemetry = balanced = 0
+    nsec = 0
+    for sec in sections:
+        n = len(sec.items)
+        if not n:
+            continue
+        nsec += 1
+        total += n
+        if sec.preset == "telemetry":
+            telemetry += n
+            balanced += n
+        elif sec.preset == "balanced":
+            balanced += n
+    return CatalogStats(total=total, sections=nsec,
+                        telemetry=telemetry, balanced=balanced)
+
+
+def plist_domains() -> dict[str, set[str]]:
+    """label -> launchd domains its job definition lives in. A LaunchAgents
+    plist is a `gui/$UID` job, a LaunchDaemons plist a `system` job."""
+    found: dict[str, set[str]] = {}
+    for d in LAUNCHD_DIRS:
+        domain = f"gui/{UID}" if d.endswith("LaunchAgents") else "system"
+        for p in glob.glob(d + "/*.plist"):
+            found.setdefault(os.path.basename(p)[:-6], set()).add(domain)
+    return found
+
+
+def domain_state(domain: str) -> tuple[dict[str, int], set[str]]:
+    """({label: pid, 0 when not running}, labels disabled by an override there).
+    One `launchctl print <domain>` carries both; its `disabled services` block
+    is the same table `print-disabled` shows, and its `services` block is
+    launchd's own pid for every job registered in the domain."""
+    r = subprocess.run(["launchctl", "print", domain],
+                       capture_output=True, text=True, check=False)
+    registered: dict[str, int] = {}
+    disabled: set[str] = set()
+    block = ""
+    for line in r.stdout.splitlines():
+        header = re.match(r"^\t([\w ]+) = \{$", line)
+        if header:
+            block = header.group(1)
+            continue
+        if line.startswith("\t}"):
+            block = ""
+            continue
+        if block == "services":
+            fields = line.split()
+            if fields:
+                registered[fields[-1]] = int(fields[0]) if fields[0].isdigit() else 0
+        elif block == "disabled services":
+            entry = re.match(r'\s*"([^"]+)"\s*=>\s*(true|disabled)\s*$', line)
+            if entry:
+                disabled.add(entry.group(1))
+    return registered, disabled
+
+
+def drop_wrong_macos(sections: list[Section],
+                     major: int | None = None) -> list[str]:
+    """Drop sections gated to another macOS major (e.g. [macos>=27] on 26)."""
+    if major is None:
+        major = macos_major()
+    skipped: list[str] = []
+    keep_secs: list[Section] = []
+    for sec in sections:
+        if sec.macos and not macos_matches(sec.macos, major):
+            skipped.extend(it.label for it in sec.items)
+            continue
+        keep_secs.append(sec)
+    sections[:] = keep_secs
+    return skipped
+
+
+def drop_absent_labels(sections: list[Section]) -> list[str]:
+    """Record for every label the domains it lives in, and remove the ones this
+    macOS build doesn't have at all (renamed/removed by Apple, or wrong for this
+    OS). Returns the dropped labels so callers can report them. Prevents phantom
+    entries showing as enabled no-ops."""
+    from_plists = plist_domains()
+    registered = {d: domain_state(d)[0] for d in DOMAINS}
+    absent: list[str] = []
+    for sec in sections:
+        keep: list[Item] = []
+        for it in sec.items:
+            it.domains = set(from_plists.get(it.label, ()))
+            it.domains |= {d for d in DOMAINS if it.label in registered[d]}
+            if it.domains:
+                keep.append(it)
+            else:
+                absent.append(it.label)
+        sec.items = keep
+    sections[:] = [s for s in sections if s.items]
+    return absent
+
+
+def refresh_state(sections: list[Section]) -> None:
+    """An override only takes effect in the domain the job is registered in, so
+    a label counts as disabled only when every domain it lives in overrides it.
+    Unioning the domains instead reports an inert override as success."""
+    disabled = {d: domain_state(d)[1] for d in DOMAINS}
+    for sec in sections:
+        for it in sec.items:
+            it.disabled = all(it.label in disabled[d] for d in it.domains)
+            it.selected = not it.disabled
+
+
+def running_pids(labels: list[str]) -> dict[str, list[int]]:
+    """{label: [pids]} for the given labels, straight from launchd. Matching a
+    process name to a label instead guesses wrong whenever two labels share a
+    last segment (`com.apple.spindump` / `com.apple.metadata.mds.spindump`)."""
+    if not labels:
+        return {}
+    wanted = set(labels)
+    out: dict[str, list[int]] = {}
+    for domain in DOMAINS:
+        for label, pid in domain_state(domain)[0].items():
+            if pid and label in wanted:
+                out.setdefault(label, []).append(pid)
+    return out
+
+
+def pending_changes(sections: list[Section]) -> tuple[list[str], list[str]]:
+    to_disable: list[str] = []
+    to_enable: list[str] = []
+    for sec in sections:
+        for it in sec.items:
+            wants_enabled = it.selected
+            is_enabled = not it.disabled
+            if wants_enabled and not is_enabled:
+                to_enable.append(it.label)
+            elif not wants_enabled and is_enabled:
+                to_disable.append(it.label)
+    return to_disable, to_enable
+
+
+def bootstrap_if_absent(label: str, domain: str) -> None:
+    """Re-register an enabled service that an earlier bootout removed."""
+    if label in domain_state(domain)[0]:
+        return
+    for directory in LAUNCHD_DIRS:
+        is_daemon = directory.endswith("LaunchDaemons")
+        if is_daemon != (domain == "system"):
+            continue
+        plist = Path(directory) / f"{label}.plist"
+        if plist.exists():
+            subprocess.run(["sudo", "launchctl", "bootstrap", domain, str(plist)],
+                           capture_output=True, check=False)
+            return
+
+
+def progress(text: str) -> None:
+    """Overwrite one line in place. An apply is two sudo `launchctl` runs per
+    label per domain, so `--disable-all` sits silent for hundreds of them
+    otherwise. Skipped off a tty so piped output never gets \\r spam."""
+    if not sys.stdout.isatty():
+        return
+    # Wrapping would leave every frame on screen instead of overwriting one line.
+    w = min(78, os.get_terminal_size().columns - 1)
+    sys.stdout.write("\r" + text[:w].ljust(w) + "\r")
+    sys.stdout.flush()
+
+
+def apply_changes(sections: list[Section], report=progress, *, retry_running: bool = False,
+                  stop_processes: bool = True) -> dict:
+    to_disable, to_enable = pending_changes(sections)
+    if retry_running:
+        desired = [it.label for sec in sections for it in sec.items if not it.selected and not it.is_locked]
+        to_disable = sorted(set(to_disable) | set(running_pids(desired)))
+    domains_of = {it.label: it.domains for sec in sections for it in sec.items}
+    override_failures: list[tuple[str, str]] = []
+    bootout_failures: dict[str, int] = {}
+
+    def launchctl(action: str, domain: str, label: str) -> None:
+        r = subprocess.run(["sudo", "launchctl", action, f"{domain}/{label}"],
+                           capture_output=True, text=True, check=False)
+        if r.returncode == 0:
+            return
+        said = (r.stderr or r.stdout).strip().splitlines()
+        msg = said[-1] if said else f"exit {r.returncode}"
+        if action == "bootout":
+            bootout_failures[msg] = bootout_failures.get(msg, 0) + 1
+        else:
+            override_failures.append((f"{action} {domain}/{label}", msg))
+
+    # Phase 1: launchctl disable + bootout (or enable), only in the domains the
+    # job is registered in — an override written elsewhere never takes effect.
+    total = len(to_disable) + len(to_enable)
+    width = len(str(total))
+    for n, label in enumerate(to_disable, 1):
+        report(f"  disabling  {n:>{width}}/{total}  {label}")
+        for domain in sorted(domains_of[label]):
+            launchctl("disable", domain, label)
+            launchctl("bootout", domain, label)
+    for n, label in enumerate(to_enable, len(to_disable) + 1):
+        report(f"  enabling   {n:>{width}}/{total}  {label}")
+        for domain in sorted(domains_of[label]):
+            launchctl("enable", domain, label)
+            bootstrap_if_absent(label, domain)
+
+    # Stop remaining processes once; report anything launchd starts again.
+    killed = 0
+    if to_disable and stop_processes:
+        report("  looking for survivors...")
+        survivors = running_pids(to_disable)
+        for label, pids in survivors.items():
+            report(f"  killing    {label}")
+            for pid in pids:
+                r = subprocess.run(["sudo", "kill", "-9", str(pid)],
+                                   capture_output=True, check=False)
+                if r.returncode == 0:
+                    killed += 1
+
+    # Phase 3: brief settle then verify nothing respawned
+    report("  verifying...")
+    time.sleep(0.4)
+    stragglers: dict[str, list[int]] = {}
+    if to_disable:
+        stragglers = running_pids(to_disable)
+
+    disabled_now = {d: domain_state(d)[1] for d in DOMAINS}
+    report("")
+    return {
+        "disabled": len(to_disable),
+        "enabled": len(to_enable),
+        "killed": killed,
+        "stragglers": stragglers,
+        "override_failures": override_failures,
+        "bootout_failures": bootout_failures,
+        "not_disabled": [l for l in to_disable
+                         if not all(l in disabled_now[d] for d in domains_of[l])],
+        "not_enabled": [l for l in to_enable
+                        if any(l in disabled_now[d] for d in domains_of[l])],
+    }
+
+
+def apply_problems(result: dict) -> str:
+    """The report as text rather than printed: the TUI stays on the alternate
+    screen through an apply, so anything written there is gone the moment
+    curses exits. It holds this until after that."""
+    out: list[str] = []
+    for cmd, msg in result["override_failures"]:
+        out.append(f"  FAILED  launchctl {cmd}: {msg}")
+    for msg, count in sorted(result["bootout_failures"].items(), key=lambda kv: -kv[1]):
+        out.append(f"  bootout failed on {count} label(s): {msg}")
+    for key, verb in (("not_disabled", "disabled"), ("not_enabled", "enabled")):
+        if result[key]:
+            out.append(f"⚠ {len(result[key])} labels are NOT {verb} in every domain they "
+                       f"run in — the override did not take effect:")
+            out.extend(f"  {label}" for label in result[key])
+    if result["stragglers"]:
+        out.append(f"{len(result['stragglers'])} respawned by launchd:")
+        out.extend(f"  {label}  pids={pids}" for label, pids in result["stragglers"].items())
+    return "".join(f"{line}\n" for line in out)
+
+
+def reopen_tty_stdin() -> bool:
+    """`curl ... | python3` feeds the script on stdin, leaving fd 0 as a spent
+    pipe rather than a terminal. curses then busy-loops on getch (ERR, spawning
+    mdutil every frame) or fails cbreak outright. Point fd 0 at the controlling
+    terminal so the TUI reads real keystrokes."""
+    if sys.stdin.isatty():
+        return True
+    try:
+        tty = open("/dev/tty")
+    except OSError:
+        return False
+    os.dup2(tty.fileno(), 0)
+    sys.stdin = tty
+    return True
+
+
+def is_sip_enabled() -> bool:
+    r = subprocess.run(["csrutil", "status"], capture_output=True, text=True, check=False)
+    return "disabled" not in r.stdout
+
+
+def lock_sip_rows(sections: list[Section], is_sip_on: bool) -> int:
+    """With SIP on, a `[sip-off]` label is restarted by launchd within seconds of
+    a disable, so it can't be switched off — only back on. Returns the count."""
+    locked = 0
+    for sec in sections:
+        for it in sec.items:
+            it.is_locked = is_sip_on and it.is_sip_off_required
+            locked += it.is_locked
+    return locked
+
+
+def keep_locked_on(sections: list[Section]) -> int:
+    """Undo any selection that would switch a locked label off."""
+    kept = 0
+    for sec in sections:
+        for it in sec.items:
+            if it.is_locked and not it.selected and not it.disabled:
+                it.selected = True
+                kept += 1
+    return kept
+
+
+SIP_COST = ("iPhone/iPad apps stop running on this Mac, and root processes can modify "
+            "system files and load unsigned kernel extensions")
+
+
+def recovery_steps(is_on: bool) -> str:
+    """Apple silicon only lowers boot security from Recovery entered with the
+    power button, so a physical Mac can refuse csrutil from macOS."""
+    return f"""csrutil could not change SIP from inside macOS. Do it from Recovery:
+  1. Shut down the Mac.
+  2. Press and hold the power button until "Loading startup options" appears.
+  3. Choose Options, then Continue, and sign in with an admin user.
+  4. From the menu bar: Utilities > Terminal.
+  5. Type: csrutil {'enable' if is_on else 'disable'}   and answer its prompts.
+  6. Restart, then run debloat again.
+"""
+
+
+def set_sip(is_on: bool) -> int:
+    """`csrutil` asks y/n, an admin user and their password on the terminal."""
+    r = subprocess.run(["sudo", "csrutil", "enable" if is_on else "disable"], check=False)
+    return r.returncode
+
+
+def prime_sudo() -> bool:
+    result = subprocess.run(["sudo", "-v"], check=False)
+    return result.returncode == 0
+
+
+def spotlight_state() -> str:
+    """'on', 'off', or 'indexing' (index wiped, rebuild in progress).
+
+    Read from `/`, not the Data volume: after `mdutil -d` the Data volume
+    answers "unknown indexing state" while `/` says "Indexing and searching
+    disabled", so reading Data reports a disabled Spotlight as rebuilding."""
+    r = subprocess.run(["mdutil", "-s", "/"], capture_output=True, text=True, check=False)
+    if "disabled" in r.stdout:
+        return "off"
+    if "Indexing enabled" in r.stdout:
+        return "on"
+    return "indexing"
+
+
+SPOTLIGHT_SECTION = "Spotlight file index"
+SPOTLIGHT_COMMENT = ("reads every new or changed file to power Cmd-Space and Finder search. "
+                     "Off: no background indexing, RAM and CPU back; VS Code, grep, fd, git "
+                     "unaffected. Lost: Cmd-Space file search, Finder search, Mail search")
+SPOTLIGHT_INDEXING = ("rebuilding the index — this runs for 10-30 minutes of CPU. Cmd-Space "
+                      "and Finder search stay incomplete until it lands; nothing to do but "
+                      "wait, and quitting here does not stop it")
+
+
+def spotlight_section() -> Section:
+    item = Item(label="Spotlight", comment=SPOTLIGHT_COMMENT, section=SPOTLIGHT_SECTION)
+    section = Section(title=SPOTLIGHT_SECTION, items=[item])
+    refresh_spotlight(section)
+    return section
+
+
+def refresh_spotlight(section: Section) -> None:
+    item = section.items[0]
+    item.state = spotlight_state()
+    item.disabled = item.state == "off"
+    item.selected = not item.disabled
+    item.comment = SPOTLIGHT_INDEXING if item.state == "indexing" else SPOTLIGHT_COMMENT
+
+
+def spotlight_set(enabled: bool, report=progress) -> tuple[bool, str]:
+    report(f"  turning Spotlight {'on' if enabled else 'off'}...")
+    if not enabled:
+        # `-i off` leaves the Data volume's indexer running on macOS 26; `-d`
+        # stops indexing and searching on every volume.
+        r = subprocess.run(["sudo", "mdutil", "-a", "-d"],
+                           capture_output=True, text=True, check=False)
+        report("")
+        if r.returncode != 0:
+            return False, f"mdutil failed: {r.stderr.strip()}"
+        return True, "Spotlight off — indexing and search stopped"
+    r = subprocess.run(["sudo", "mdutil", "-a", "-i", "on"],
+                       capture_output=True, text=True, check=False)
+    if r.returncode != 0:
+        report("")
+        return False, f"mdutil failed: {r.stderr.strip()}"
+    # `-i on` only sets the flag; a previously disabled index stays in an
+    # "unknown" state and never rebuilds, so Finder metadata queries hang.
+    e = subprocess.run(["sudo", "mdutil", "-a", "-E"],
+                       capture_output=True, text=True, check=False)
+    report("")
+    if e.returncode != 0:
+        return False, f"mdutil -E failed: {e.stderr.strip()}"
+    return True, "Spotlight on — full reindex running (~10-30 min of CPU)"
+
+
+def flat_index(sections: list[Section]) -> list[Item]:
+    out: list[Item] = []
+    for sec in sections:
+        for it in sec.items:
+            out.append(it)
+    return out
+
+
+MENU_SECTION = "预设 — 回车应用"
+
+
+def menu_section(sections: list[Section]) -> Section:
+    """The action rows above the checkboxes. Disable/enable all drop out once
+    the machine is already in that state, so every row on offer does something."""
+    flat = flat_index(sections)
+    known = {it.label for it in flat}
+    sizes = {name: len({it.label for sec in resolve_preset(sections, name)
+                        for it in sec.items} & known)
+             for name in BUILTIN_PRESETS}
+    items = [
+        Item(label="全量精简（保留 AirDrop / 应用搜索）", section=MENU_SECTION,
+             action="preset:" + EXTREME_PRESET,
+             comment=f"处理 {sizes[EXTREME_PRESET]} 项；保留所需依赖及系统基础服务"),
+        Item(label="telemetry", section=MENU_SECTION, action="preset:telemetry",
+             comment=f"disable {sizes['telemetry']} labels — analytics, crash reports, ads, beta"),
+        Item(label="balanced", section=MENU_SECTION, action="preset:balanced",
+             comment=f"disable {sizes['balanced']} labels — telemetry + Siri, Apple "
+                     f"Intelligence, iMessage"),
+    ]
+    if not all(it.disabled for it in flat):
+        items.append(Item(
+            label="disable all", section=MENU_SECTION, action="disable-all",
+            comment=f"disable all {len(flat)} labels — breaks iCloud login, App Store, Updates"))
+    if any(it.disabled for it in flat):
+        items.append(Item(
+            label="enable all", section=MENU_SECTION, action="enable-all",
+            comment=f"turn all {len(flat)} labels back on — the panic button"))
+    locked = sum(it.is_locked for it in flat)
+    needs_sip = sum(it.is_sip_off_required for it in flat)
+    if locked:
+        items.append(Item(
+            label="disable SIP", section=MENU_SECTION, action="sip-off",
+            comment=f"unlock the {locked} greyed-out labels — iPhone/iPad apps stop running; "
+                    f"password, then a restart"))
+    elif needs_sip:
+        items.append(Item(
+            label="enable SIP", section=MENU_SECTION, action="sip-on",
+            comment=f"turn System Integrity Protection back on (restart); the {needs_sip} "
+                    f"SIP-only labels come back at the next boot"))
+    return Section(title=MENU_SECTION, items=items)
+
+
+def select_for_action(sections: list[Section], action: str) -> str:
+    """Tick the checkboxes the way `action` wants them, and name it for the
+    status line. Same rule as `--preset` on the command line: a preset disables
+    its own labels, leaves the rest as they are, and re-enables nothing."""
+    flat = flat_index(sections)
+    if action in ("disable-all", "enable-all"):
+        for it in flat:
+            it.selected = action == "enable-all"
+        kept = keep_locked_on(sections)
+        return action.replace("-", " ") + (f" ({kept} need SIP off, skipped)" if kept else "")
+    name = action.split(":", 1)[1]
+    wanted = {it.label for sec in resolve_preset(sections, name) for it in sec.items}
+    for it in flat:
+        it.selected = (bool(preserve_reason(it.label)) if name == EXTREME_PRESET
+                               else it.label not in wanted and not it.disabled)
+    kept = keep_locked_on(sections)
+    return f"preset {name}" + (f" ({kept} need SIP off, skipped)" if kept else "")
+
+
+def jump_section(sections: list[Section], flat: list[Item], cursor: int, direction: int) -> int:
+    """Move cursor to first item of next/prev section."""
+    sec_start_indices: list[int] = []
+    idx = 0
+    for sec in sections:
+        if sec.items:
+            sec_start_indices.append(idx)
+            idx += len(sec.items)
+    if not sec_start_indices:
+        return cursor
+    if direction > 0:
+        for s in sec_start_indices:
+            if s > cursor:
+                return s
+        return sec_start_indices[-1]
+    else:
+        prev = sec_start_indices[0]
+        for s in sec_start_indices:
+            if s >= cursor:
+                return prev
+            prev = s
+        return sec_start_indices[-1]
+
+
+def build_display_rows(sections: list[Section]) -> tuple[list[tuple[str, object]], dict[int, int]]:
+    """Return (display_rows, item_idx_to_row_idx).
+    display_rows entries: ("section", title) | ("item", Item) | ("blank", None)."""
+    rows: list[tuple[str, object]] = []
+    item_to_row: dict[int, int] = {}
+    item_idx = 0
+    for sec in sections:
+        rows.append(("section", sec.title))
+        for it in sec.items:
+            item_to_row[item_idx] = len(rows)
+            rows.append(("item", it))
+            item_idx += 1
+        rows.append(("blank", None))
+    return rows, item_to_row
+
+
+SPINNER = "▖▘▝▗"
+COMMENT_COL = len("  [✓]  ") + 48 + 2
+SPINNER_MS = 140
+SPOTLIGHT_POLL_S = 3
+
+
+def draw(stdscr, sections: list[Section], cursor: int, status: str, scroll: list[int],
+         tick: int = 0) -> None:
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    title = ("macOS 精简   ↑↓ 移动   空格 勾选   [ ] 分组   "
+             "回车 应用   r 刷新   q 退出")
+    stdscr.addnstr(0, 0, title[:w - 1], w - 1, curses.A_BOLD)
+
+    diff_count = sum(
+        1 for sec in sections for it in sec.items
+        if not it.action and it.selected == it.disabled
+    )
+    present = sum(
+        1 for sec in sections for it in sec.items
+        if not it.action and sec.title not in (MENU_SECTION, SPOTLIGHT_SECTION)
+    )
+    if present == CATALOG_TOTAL:
+        where = f"{present} labels"
+    else:
+        where = f"{present}/{CATALOG_TOTAL} on this Mac"
+    sub = (f"[✓] 启用   [ ] 禁用   * 待应用: {diff_count}   "
+           f"{where}")
+    stdscr.addnstr(1, 0, sub[:w - 1], w - 1, curses.A_DIM)
+
+    flat = flat_index(sections)
+    current = flat[cursor]
+    about = current.comment
+    if current.action == "sip-off":
+        about = (current.comment.split(" — ")[0]
+                 + f". Cost: {SIP_COST}. Asks your password, then a restart.")
+    if current.is_locked:
+        about = ("with SIP on, macOS restarts this within seconds of a disable — "
+                 "'disable SIP' at the top unlocks it. " + about)
+    explanation = textwrap.wrap(f"{current.label}: {about}", w - 1,
+                                break_on_hyphens=False)[:max(2, h // 4)]
+
+    # A long comment wraps onto extra lines under its own column.
+    room = max(20, w - 1 - COMMENT_COL)
+    lines: list[tuple[str, str, Item | None]] = []
+    first_line: dict[int, int] = {}
+    for kind, payload in build_display_rows(sections)[0]:
+        if kind != "item":
+            lines.append((kind, payload or "", None))
+            continue
+        it = payload  # type: ignore[assignment]
+        if it.action:
+            head = f"   ▸   {it.label:<48}  "
+            comment = it.comment
+        elif it.state == "indexing" and it.selected != it.disabled:
+            # A ticked change outranks the spinner: the user must still see
+            # the `*` and the box they asked for while the rebuild runs.
+            head = f"  [{SPINNER[tick % len(SPINNER)]}]  {it.label:<48}  "
+            comment = it.comment
+        else:
+            mark = "[✓]" if it.selected else "[ ]"
+            changed = " *" if it.selected == it.disabled else "  "
+            head = f"{changed}{mark}  {it.label:<48}  "
+            comment = ("needs SIP off · " if it.is_locked else "") + it.comment
+        chunks = textwrap.wrap(comment, room, break_on_hyphens=False) or [""]
+        first_line[id(it)] = len(lines)
+        lines.append(("item", head + chunks[0], it))
+        lines.extend(("item", " " * COMMENT_COL + chunk, it) for chunk in chunks[1:])
+
+    content_top = 3
+    content_bottom = h - 2 - len(explanation)
+    visible_h = max(1, content_bottom - content_top)
+
+    top = first_line.get(id(current), 0)
+    bottom = top + sum(1 for _, _, it in lines if it is current) - 1
+    so = scroll[0]
+    if top < so:
+        so = top
+    elif bottom >= so + visible_h:
+        so = min(top, bottom - visible_h + 1)
+    so = max(0, min(so, max(0, len(lines) - visible_h)))
+    scroll[0] = so
+
+    for screen_row, i in enumerate(range(so, min(so + visible_h, len(lines)))):
+        kind, text, it = lines[i]
+        y = content_top + screen_row
+        if kind == "section":
+            line = f"── {text} ".ljust(w - 1, "─")[:w - 1]
+            stdscr.addnstr(y, 0, line, w - 1, curses.A_DIM)
+        elif kind == "item":
+            attr = (curses.A_REVERSE if it is current else
+                    curses.A_DIM if it.is_locked else curses.A_NORMAL)
+            stdscr.addnstr(y, 0, text[:w - 1], w - 1, attr)
+        # blank: leave row empty
+
+    if so > 0:
+        try:
+            stdscr.addnstr(content_top, max(0, w - 2), "↑", 1, curses.A_DIM)
+        except curses.error:
+            pass
+    if so + visible_h < len(lines):
+        try:
+            stdscr.addnstr(content_bottom - 1, max(0, w - 2), "↓", 1, curses.A_DIM)
+        except curses.error:
+            pass
+
+    try:
+        for n, line in enumerate(explanation):
+            stdscr.addnstr(content_bottom + n, 0, line, w - 1, curses.A_DIM)
+        if status:
+            stdscr.addnstr(h - 1, 0, status[:w - 1], w - 1, curses.A_BOLD)
+    except curses.error:
+        pass
+    stdscr.refresh()
+
+
+def run_tui(stdscr, sections: list[Section]) -> str | None:
+    curses.curs_set(0)
+    cursor = 0
+    status = ""
+    scroll = [0]
+    spotlight = spotlight_section()
+    tick = 0
+    polled_at = 0.0
+    problem_reports: list[str] = []
+
+    def in_tui(text: str) -> None:
+        """Apply progress on the bottom line, since the TUI never leaves the
+        screen now. Same calls that write `\\r` lines on the command line."""
+        h, w = stdscr.getmaxyx()
+        stdscr.move(h - 1, 0)
+        stdscr.clrtoeol()
+        stdscr.addnstr(h - 1, 0, text.strip()[:w - 1], w - 1, curses.A_BOLD)
+        stdscr.refresh()
+
+    while True:
+        view = [menu_section(sections), spotlight, *sections]
+        flat = flat_index(view)
+        cursor = max(0, min(cursor, len(flat) - 1))
+        # Only run getch on a timer while the spinner has something to say —
+        # a permanent timeout would put us back in the issue #1 busy-loop, and
+        # the poll is rate-limited separately so the animation never costs an
+        # `mdutil` per frame.
+        is_spinning = spotlight.items[0].state == "indexing"
+        stdscr.timeout(SPINNER_MS if is_spinning else -1)
+        draw(stdscr, view, cursor, status, scroll, tick)
+        c = stdscr.getch()
+        if c == -1:
+            tick += 1
+            if time.time() - polled_at > SPOTLIGHT_POLL_S:
+                refresh_spotlight(spotlight)
+                polled_at = time.time()
+            continue
+        status = ""
+        if c in (ord("q"), 27):
+            return "".join(problem_reports) or None
+        if c in (curses.KEY_DOWN, ord("j")):
+            cursor = min(cursor + 1, len(flat) - 1)
+        elif c in (curses.KEY_UP, ord("k")):
+            cursor = max(cursor - 1, 0)
+        elif c == curses.KEY_NPAGE:
+            cursor = min(cursor + 10, len(flat) - 1)
+        elif c == curses.KEY_PPAGE:
+            cursor = max(cursor - 10, 0)
+        elif c == ord(" "):
+            row = flat[cursor]
+            if row.is_locked and row.selected:
+                status = f"{row.label} needs SIP off — see 'disable SIP' at the top"
+            elif not row.action:
+                row.selected = not row.selected
+        elif c == ord("]"):
+            cursor = jump_section(view, flat, cursor, direction=1)
+        elif c == ord("["):
+            cursor = jump_section(view, flat, cursor, direction=-1)
+        elif c == ord("r"):
+            refresh_state(sections)
+            refresh_spotlight(spotlight)
+            status = "状态已刷新"
+        elif c in (curses.KEY_ENTER, 10, 13):
+            action = flat[cursor].action
+            if action in ("sip-off", "sip-on"):
+                h, w = stdscr.getmaxyx()
+                ask = (f"turn SIP off? {SIP_COST}  [y/N]" if action == "sip-off"
+                       else "turn SIP back on? SIP-only labels come back at the next boot  [y/N]")
+                stdscr.move(h - 1, 0)
+                stdscr.clrtoeol()
+                stdscr.addnstr(h - 1, 0, ask[:w - 1], w - 1, curses.A_REVERSE)
+                stdscr.refresh()
+                stdscr.timeout(-1)
+                if stdscr.getch() not in (ord("y"), ord("Y")):
+                    status = "SIP unchanged"
+                    continue
+                # csrutil reads its y/n, user and password prompts as lines; under curses'
+                # cbreak/noecho mode Enter never completes them, so leave curses entirely.
+                curses.endwin()
+                is_on = action == "sip-on"
+                code = set_sip(is_on)
+                print("\n" + (recovery_steps(is_on) if code else
+                              "Done — restart the Mac for it to take effect, then run debloat again."))
+                input("press enter to go back to debloat ")
+                stdscr.refresh()
+                status = ("csrutil refused from macOS — see the Recovery steps above" if code else
+                          "SIP change takes effect after a restart")
+                continue
+            if action == "disable-all":
+                h, w = stdscr.getmaxyx()
+                ask = (f"disable all {len(flat_index(sections))} labels? iCloud login, App "
+                       f"Store purchases and macOS Update installs will break  [y/N]")
+                stdscr.move(h - 1, 0)
+                stdscr.clrtoeol()
+                stdscr.addnstr(h - 1, 0, ask[:w - 1], w - 1, curses.A_REVERSE)
+                stdscr.refresh()
+                stdscr.timeout(-1)
+                if stdscr.getch() not in (ord("y"), ord("Y")):
+                    status = "disable all cancelled"
+                    continue
+            done = f"{select_for_action(sections, action)} — " if action else ""
+            spot = spotlight.items[0]
+            if not any(pending_changes(sections)) and spot.selected != spot.disabled:
+                status = f"{done}nothing to change"
+                continue
+            # No endwin: that emits rmcup and drops the user back into their
+            # shell scrollback mid-apply. sudo prompts on the alternate screen
+            # instead, and redrawwin repairs what it wrote over.
+            curses.def_prog_mode()
+            h, w = stdscr.getmaxyx()
+            stdscr.move(h - 1, 0)
+            stdscr.clrtoeol()
+            stdscr.refresh()
+            curses.curs_set(1)
+            is_root = prime_sudo()
+            curses.curs_set(0)
+            curses.reset_prog_mode()
+            stdscr.redrawwin()
+            stdscr.refresh()
+            if not is_root:
+                status = f"{done}sudo failed — nothing applied"
+                continue
+            write_snapshot(sections)
+            result = apply_changes(sections, report=in_tui, retry_running=True)
+            daemon_msg = sync_boot_daemon(sections)
+            refresh_state(sections)
+            spotlight_msg = ""
+            if spot.selected == spot.disabled:
+                _, spotlight_msg = spotlight_set(spot.selected, report=in_tui)
+                refresh_spotlight(spotlight)
+            status = (
+                f'{done}applied: {result["disabled"]} disabled, {result["enabled"]} enabled, '
+                f'{result["killed"]} killed'
+            )
+            if spotlight_msg:
+                status += f"   {spotlight_msg}"
+            if daemon_msg:
+                status += f"   {daemon_msg}"
+            report = apply_problems(result)
+            if report:
+                problems = (len(result["override_failures"]) + len(result["not_disabled"])
+                            + len(result["not_enabled"]) + len(result["stragglers"]))
+                status += f"  ⚠ {problems} problems (printed after quit)"
+                problem_reports.append(f"\n[debloat] apply problems:\n{report}")
+
+
+def macos_major() -> int | None:
+    r = subprocess.run(["sw_vers", "-productVersion"],
+                       capture_output=True, text=True, check=False)
+    part = r.stdout.strip().split(".")[0]
+    return int(part) if part.isdigit() else None
+
+
+def mem_free_mb() -> int | None:
+    """Reclaimable RAM (free + inactive + speculative + purgeable) in MB."""
+    r = subprocess.run(["vm_stat"], capture_output=True, text=True, check=False)
+    if r.returncode != 0:
+        return None
+    page = re.search(r"page size of (\d+) bytes", r.stdout)
+    if not page:
+        return None
+    page_bytes = int(page.group(1))
+    pages = 0
+    for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
+        m = re.search(rf"{key}:\s+(\d+)\.", r.stdout)
+        if m:
+            pages += int(m.group(1))
+    return pages * page_bytes // (1024 * 1024)
+
+
+def write_snapshot(sections: list[Section]) -> Path:
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    states = {d: domain_state(d) for d in DOMAINS}
+    domains = {}
+    for domain, (registered, disabled) in states.items():
+        present = sorted(it.label for sec in sections for it in sec.items if domain in it.domains)
+        domains[domain] = {
+            "present": present,
+            "disabled": sorted(set(present) & disabled),
+            "running": sorted(label for label in present if registered.get(label, 0)),
+        }
+    stamp = datetime.now().astimezone().isoformat()
+    build = subprocess.run(["sw_vers", "-buildVersion"], capture_output=True, text=True, check=False).stdout.strip()
+    snap = {"created_at": stamp, "build": build, "uid": UID, "domains": domains,
+            "disabled": [it.label for sec in sections for it in sec.items if it.disabled],
+            "spotlight": spotlight_state(),
+            "persist": json.loads(PERSIST_STATE.read_text()) if PERSIST_STATE.exists() else None}
+    payload = json.dumps(snap, ensure_ascii=False, indent=2)
+    archive = BACKUP_DIR / "snapshots" / (datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".json")
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    archive.write_text(payload)
+    (BACKUP_DIR / "latest.json").write_text(payload)
+    if os.geteuid() == 0 and UID:
+        for target in (BACKUP_DIR, archive.parent, archive, BACKUP_DIR / "latest.json"):
+            os.chown(target, UID, pwd.getpwuid(UID).pw_gid)
+    return archive
+
+
+def load_snapshot() -> dict | None:
+    path = BACKUP_DIR / "latest.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
+
+
+def run_apply(sections: list[Section], dry_run: bool) -> int:
+    to_disable, to_enable = pending_changes(sections)
+    wanted_off = [it.label for sec in sections for it in sec.items if not it.selected and not it.is_locked]
+    running = running_pids(wanted_off)
+    if not to_disable and not to_enable and not running:
+        print("无需更改：已处于请求状态")
+        return 0
+    if dry_run:
+        print(f"[dry-run] 配置禁用 {len(to_disable)} 项，恢复启用 {len(to_enable)} 项；目标中仍运行 {len(running)} 项")
+        for label in sorted(set(to_disable) | set(running)):
+            print(f"  disable  {label}")
+        for label in to_enable:
+            print(f"  enable   {label}")
+        return 0
+    if not prime_sudo():
+        print("需要管理员权限", file=sys.stderr)
+        return 1
+    snapshot = write_snapshot(sections)
+    print(f"恢复快照：{snapshot}", flush=True)
+    result = apply_changes(sections, retry_running=True)
+    daemon_msg = sync_boot_daemon(sections)
+    (BACKUP_DIR / "last-apply.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
+    print(f'处理完成：尝试禁用/停止 {result["disabled"]} 项，启用 {result["enabled"]} 项；停止进程 {result["killed"]} 个')
+    if daemon_msg:
+        print(daemon_msg)
+    sys.stderr.write(apply_problems(result))
+    return 2 if result["not_disabled"] or result["not_enabled"] or result["stragglers"] else 0
+
+
+def cmd_status(sections: list[Section], as_json: bool) -> int:
+    refresh_state(sections)
+    disabled = sum(1 for sec in sections for it in sec.items if it.disabled)
+    total = sum(len(sec.items) for sec in sections)
+    running = running_pids([it.label for sec in sections for it in sec.items])
+    ignored = sorted(it.label for sec in sections for it in sec.items
+                     if it.disabled and it.label in running)
+    spot = spotlight_state()
+    free = mem_free_mb()
+    stats = catalog_stats()
+    if as_json:
+        print(json.dumps({
+            "catalog": {
+                "total": stats.total,
+                "sections": stats.sections,
+                "telemetry": stats.telemetry,
+                "balanced": stats.balanced,
+            },
+            "labels_present": total,
+            "disabled": disabled,
+            "enabled": total - disabled,
+            "running": sorted(running),
+            "disabled_but_running": ignored,
+            "spotlight": spot,
+            "reclaimable_ram_mb": free,
+            "persist": persist_status(),
+            "sip": {"enabled": is_sip_enabled(),
+                    "locked": sum(it.is_locked for sec in sections for it in sec.items)},
+        }, indent=2))
+        return 0
+    print(f"catalog: {stats.total} labels in {stats.sections} sections "
+          f"(telemetry {stats.telemetry}, balanced {stats.balanced})")
+    print(f"labels present on this macOS: {total}")
+    print(f"  disabled: {disabled}   enabled: {total - disabled}")
+    print(f"  running now: {len(running)}")
+    if ignored:
+        print(f"  disabled but running anyway: {len(ignored)}   "
+              f"(launchd started these despite the override)")
+    print(f"spotlight: {spot}")
+    locked = sum(it.is_locked for sec in sections for it in sec.items)
+    if locked:
+        print(f"SIP: on — {locked} labels need it off to stay disabled "
+              f"(`debloat --disable-sip`)")
+    else:
+        print(f"SIP: {'on' if is_sip_enabled() else 'off'}")
+    persist = persist_status()
+    if persist["installed"]:
+        line = f"boot daemon: on, {persist['labels']} services re-disabled at every boot"
+        if persist["respawners"] is not None:
+            line += (f"; last boot left {len(persist['respawners'])} running that "
+                     f"respawn when killed")
+        print(line)
+    if free is not None:
+        print(f"reclaimable RAM now: ~{free} MB")
+    return 0
+
+
+def cmd_audit(sections: list[Section], absent: list[str],
+              version_skip: list[str] | None = None) -> int:
+    stats = catalog_stats()
+    present = sum(len(sec.items) for sec in sections)
+    major = macos_major()
+    print(f"catalog: {stats.total} labels in {stats.sections} sections")
+    print(f"{present} labels present on this macOS build"
+          f"{f' ({major}.x)' if major is not None else ''}.")
+    if version_skip:
+        print(f"\n{len(version_skip)} embedded labels gated off this macOS "
+              f"(see [macos…] on the section):")
+        for label in version_skip:
+            print(f"  {label}")
+    if absent:
+        print(f"\n{len(absent)} embedded labels NOT present on this build (skipped):")
+        for label in absent:
+            print(f"  {label}")
+    if not absent and not version_skip:
+        print("all embedded labels apply to this build.")
+    return 0
+
+
+def persist_status() -> dict:
+    if not PERSIST_PLIST.exists():
+        return {"installed": False}
+    state = json.loads(PERSIST_STATE.read_text())
+    last = json.loads(PERSIST_REPORT.read_text()) if PERSIST_REPORT.exists() else {}
+    return {"installed": True, "labels": len(state["labels"]),
+            "last_boot": last.get("boot"), "respawners": last.get("respawners")}
+
+
+def sudo_write(path: Path, text: str) -> None:
+    subprocess.run(["sudo", "tee", str(path)], input=text, text=True,
+                   stdout=subprocess.DEVNULL, check=True)
+
+
+def script_for_daemon() -> tuple[Path | None, str]:
+    source = Path(__file__).resolve()
+    return (source, "") if source.is_file() else (None, "请先下载仓库再执行")
+
+
+def sync_boot_daemon(sections: list[Section]) -> str:
+    """With SIP on, launchd drops these overrides at every boot, so while
+    anything is disabled a root daemon re-applies them; with nothing disabled,
+    or SIP off (overrides then persist on their own), it is removed. Called
+    after every apply, with sudo already primed. Returns a line for the user,
+    or "" when nothing about the daemon changed."""
+    labels = sorted(it.label for sec in sections for it in sec.items if not it.selected)
+    is_installed = PERSIST_PLIST.exists()
+    if labels and is_sip_enabled():
+        plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{PERSIST_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>{PERSIST_DIR}/debloat.py</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{PERSIST_DIR}/daemon.log</string>
+  <key>StandardErrorPath</key><string>{PERSIST_DIR}/daemon.log</string>
+</dict>
+</plist>
+"""
+        source, why_not = script_for_daemon()
+        if source is None:
+            return (f"boot daemon NOT installed: {why_not}. These disables last until the next "
+                    f"reboot; run debloat from a file (npx, brew, or curl -o) to keep them")
+        subprocess.run(["sudo", "mkdir", "-p", str(PERSIST_DIR)], capture_output=True, check=True)
+        # Root runs this copy at every boot, so it must not stay writable by the user.
+        subprocess.run(["sudo", "install", "-m", "644", "-o", "root", "-g", "wheel",
+                        str(source.resolve()), str(PERSIST_DIR / "debloat.py")],
+                       capture_output=True, check=True)
+        if source != Path(__file__):
+            source.unlink()
+        sudo_write(PERSIST_STATE, json.dumps({"uid": UID, "labels": labels}, indent=2))
+        if is_installed:
+            return ""
+        sudo_write(PERSIST_PLIST, plist)
+        subprocess.run(["sudo", "chown", "root:wheel", str(PERSIST_PLIST)], capture_output=True, check=True)
+        return (f"boot daemon installed: macOS drops these disables at every boot while SIP "
+                f"is on, so it re-applies them ({PERSIST_PLIST}; `--enable-all` removes it)")
+    if not is_installed and not PERSIST_DIR.exists():
+        return ""
+    subprocess.run(["sudo", "launchctl", "bootout", f"system/{PERSIST_LABEL}"],
+                   capture_output=True, check=False)
+    subprocess.run(["sudo", "rm", "-f", str(PERSIST_PLIST)], check=True)
+    subprocess.run(["sudo", "rm", "-rf", str(PERSIST_DIR)], check=True)
+    return "boot daemon removed: " + ("nothing is disabled" if not labels
+                                      else "SIP is off, so disables persist on their own")
+
+
+def kill_label(label: str, pids: list[int]) -> None:
+    for domain in DOMAINS:
+        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"],
+                       capture_output=True, check=False)
+    for pid in pids:
+        subprocess.run(["kill", "-9", str(pid)], capture_output=True, check=False)
+
+
+def cmd_persist_run() -> int:
+    """The boot daemon, as root: re-disable the saved set before login, again
+    once the user's gui domain exists, then check a minute apart for the first
+    passes and every few minutes after that for as long as the Mac is up. A
+    running label is killed once; one running again after its kill respawns on
+    its own and is left alone rather than killed on every pass."""
+    global UID, DOMAINS
+    state = json.loads(PERSIST_STATE.read_text())
+    UID = state["uid"]
+    DOMAINS = ("system", f"gui/{UID}")
+    wanted = set(state["labels"])
+    run: dict = {"boot": time.strftime("%Y-%m-%dT%H:%M:%S"), "wanted": len(wanted), "passes": []}
+
+    def reapply(step: str) -> None:
+        sections = parse_labels("\n".join(sorted(wanted)))
+        drop_absent_labels(sections)
+        refresh_state(sections)
+        for sec in sections:
+            for it in sec.items:
+                it.selected = it.label not in wanted
+        result = apply_changes(sections, report=lambda _text: None, stop_processes=False)
+        run[step] = {"disabled": result["disabled"], "killed": result["killed"],
+                     "not_disabled": result["not_disabled"]}
+
+    reapply("at_boot")
+    while os.stat("/dev/console").st_uid != UID:
+        time.sleep(2)
+    run["login"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    reapply("at_login")
+
+    killed: set[str] = set()
+    respawners: set[str] = set()
+    n = 0
+    while True:
+        n += 1
+        time.sleep(PERSIST_PASS_S if n <= PERSIST_PASSES else PERSIST_WATCH_S)
+        reapply("last_pass_overrides")
+        running = running_pids(sorted(wanted))
+        fresh = {label: pids for label, pids in running.items() if label not in killed}
+        respawners |= set(running) - set(fresh)
+        for label, pids in fresh.items():
+            kill_label(label, pids)
+        killed |= set(fresh)
+        entry = {"pass": n, "at": time.strftime("%Y-%m-%dT%H:%M:%S"), "killed": sorted(fresh)}
+        run["passes"] = (run["passes"] + [entry])[-PERSIST_REPORT_PASSES:]
+        run["killed_total"] = len(killed)
+        run["respawners"] = sorted(respawners)
+        PERSIST_REPORT.write_text(json.dumps(run, indent=2))
+
+
+def cmd_restore(sections: list[Section], snapshot_path: Path | None = None) -> int:
+    snap = json.loads(snapshot_path.read_text()) if snapshot_path else load_snapshot()
+    if snap is None:
+        print(f"没有恢复快照：{BACKUP_DIR / 'latest.json'}", file=sys.stderr)
+        return 1
+    if snap["uid"] != UID:
+        print("该快照属于另一个用户", file=sys.stderr)
+        return 1
+    if not prime_sudo():
+        return 1
+    failures = []
+    for domain, state in snap["domains"].items():
+        _, disabled_now = domain_state(domain)
+        previous = set(state["disabled"])
+        for label in state["present"]:
+            should_disable = label in previous
+            if should_disable == (label in disabled_now):
+                continue
+            action = "disable" if should_disable else "enable"
+            result = subprocess.run(["sudo", "launchctl", action, f"{domain}/{label}"],
+                                    capture_output=True, text=True, check=False)
+            if result.returncode:
+                failures.append({"domain": domain, "label": label, "error": result.stderr.strip()})
+            if not should_disable and not result.returncode:
+                bootstrap_if_absent(label, domain)
+            if should_disable and label not in state["running"]:
+                subprocess.run(["sudo", "launchctl", "bootout", f"{domain}/{label}"],
+                               capture_output=True, check=False)
+    previous_persist = snap.get("persist")
+    for sec in sections:
+        for it in sec.items:
+            it.selected = not previous_persist or it.label not in previous_persist["labels"]
+    sync_boot_daemon(sections)
+    was_on = snap.get("spotlight") != "off"
+    if was_on != (spotlight_state() != "off"):
+        ok, message = spotlight_set(was_on)
+        print(message)
+        if not ok:
+            failures.append({"spotlight": message})
+    # Enabling restores launch permission; launchd starts on-demand jobs when needed.
+    for domain, state in snap["domains"].items():
+        _, disabled_now = domain_state(domain)
+        mismatched = (disabled_now & set(state["present"])) ^ set(state["disabled"])
+        failures.extend({"domain": domain, "label": label, "error": "恢复后的状态与快照不一致"}
+                        for label in sorted(mismatched))
+    print(f"恢复完成；未恢复项目 {len(failures)} 个。原始快照已保留。")
+    if failures:
+        print(json.dumps(failures, ensure_ascii=False, indent=2), file=sys.stderr)
+    return 2 if failures else 0
+
+
+def load_sections() -> tuple[list[Section], str, list[str], list[str]]:
+    sections = parse_labels(EMBEDDED_LABELS)
+    stats = catalog_stats(sections)
+    note = (f"{stats.total} embedded labels in {stats.sections} sections "
+            f"(telemetry {stats.telemetry}, balanced {stats.balanced})")
+    if USER_LABELS_FILE.exists():
+        known = {it.label for sec in sections for it in sec.items}
+        added = 0
+        for sec in parse_labels(USER_LABELS_FILE):
+            fresh: list[Item] = []
+            for it in sec.items:
+                if it.label not in known:
+                    known.add(it.label)
+                    fresh.append(it)
+            sec.items = fresh
+            sec.preset = ""
+            if sec.items:
+                sections.append(sec)
+                added += len(sec.items)
+        note += f" + {added} from {USER_LABELS_FILE}"
+    global CATALOG_TOTAL
+    CATALOG_TOTAL = sum(len(sec.items) for sec in sections)
+    version_skip = drop_wrong_macos(sections)
+    absent = drop_absent_labels(sections)
+    return sections, note, absent, version_skip
+
+
+def format_labels(sections: list[Section]) -> str:
+    lines: list[str] = []
+    for sec in sections:
+        lines.append(f"# === {sec.title} ===")
+        for it in sec.items:
+            name = f"{it.label} {SIP_OFF_TAG}" if it.is_sip_off_required else it.label
+            lines.append(f"{name.ljust(45)} # {it.comment}" if it.comment else name)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def resolve_preset(sections: list[Section], name: str) -> list[Section] | None:
+    if name == EXTREME_PRESET:
+        return [Section(title=sec.title, items=[it for it in sec.items if not preserve_reason(it.label)])
+                for sec in sections]
+    path = PRESETS_DIR / f"{name}.txt"
+    if path.exists():
+        return parse_labels(path)
+    tiers = BUILTIN_PRESETS.get(name)
+    if tiers is None:
+        return None
+    return [sec for sec in sections if sec.preset in tiers]
+
+
+def cmd_preset(sections: list[Section], name: str, dry_run: bool) -> int:
+    preset = resolve_preset(sections, name)
+    if preset is None:
+        print(f"unknown preset '{name}'. built-in: "
+              f"{', '.join(BUILTIN_PRESETS)}. custom: {PRESETS_DIR}/<name>.txt",
+              file=sys.stderr)
+        return 1
+    wanted = {it.label for sec in preset for it in sec.items}
+    if not wanted:
+        print(f"preset '{name}' lists no labels", file=sys.stderr)
+        return 1
+    refresh_state(sections)
+    known = {it.label for sec in sections for it in sec.items}
+    unknown = sorted(wanted - known)
+    for sec in sections:
+        for it in sec.items:
+            it.selected = (bool(preserve_reason(it.label)) if name == EXTREME_PRESET
+                               else it.label not in wanted and not it.disabled)
+    print(f"preset {name}: {len(wanted & known)} labels")
+    if name == EXTREME_PRESET:
+        for sec in sections:
+            for it in sec.items:
+                if preserve_reason(it.label):
+                    print(f"  保留 {it.label} — {preserve_reason(it.label)}")
+    sys.stdout.flush()
+    if unknown:
+        print(f"{len(unknown)} not in the catalog, skipped — add them via "
+              f"{USER_LABELS_FILE}:", file=sys.stderr)
+        for label in unknown:
+            print(f"  {label}", file=sys.stderr)
+    kept = keep_locked_on(sections)
+    if kept:
+        print(f"{kept} labels need SIP off and were left on (`debloat --disable-sip`)")
+    return run_apply(sections, dry_run)
+
+
+VERSION = "0.1.0"
+
+
+def help_text() -> str:
+    stats = catalog_stats()
+    return f"""macos-debloat-zh {VERSION} — macOS 系统服务精简
+
+目录：{stats.total} 个服务标识 / {stats.sections} 个分类；自动跳过本机不存在的服务。
+
+用法：./macos_disable_bloat_services.sh [选项]
+  无参数                              终端交互界面
+  --preset extreme-keep-airdrop-search 全量精简，保留 AirDrop / 应用搜索 / 基础服务
+  --preset telemetry                  遥测预设
+  --preset balanced                   均衡预设（包括禁用 AirDrop）
+  --dry-run                           只预览；单独使用时预览全量保留预设
+  --attempt-protected                 对 SIP 标记项目也尝试一次，结果可能被系统拒绝
+  --status / --verify [--json]         实际禁用配置与运行状态
+  --list / --audit                     服务清单 / 不存在或不适用的服务
+  --restore [快照.json]                恢复最近一次或指定快照的各域状态
+  --enable-all                        启用整个目录，移除开机保持程序
+  --disable-all                       禁用整个目录，包括 AirDrop 和应用搜索
+  --disable-sip / --enable-sip         请求系统修改 SIP，物理 Mac 通常需要进入恢复环境
+
+快照位置：{BACKUP_DIR}/snapshots
+SIP 开启时，成功写入禁用标记不保证服务停止；退出码 2 表示部分目标未达成。
+"""
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        print(help_text())
+        return 0
+    if "-v" in argv or "--version" in argv:
+        print(f"macos-debloat-zh {VERSION}")
+        return 0
+    if Path(__file__).resolve() == PERSIST_DIR / "debloat.py":
+        return cmd_persist_run()
+
+    major = macos_major()
+    if major is not None and major not in (26, 27):
+        print(f"warning: catalog has gates for macOS 26 and 27; this is {major}.x — "
+              f"run `debloat --audit`.",
+              file=sys.stderr)
+
+    sections, source_note, absent, version_skip = load_sections()
+    if not sections:
+        print("no labels parsed", file=sys.stderr)
+        return 1
+
+    dry_run = "--dry-run" in argv
+    as_json = "--json" in argv
+    is_sip_on = is_sip_enabled()
+    lock_sip_rows(sections, is_sip_on and "--attempt-protected" not in argv)
+
+    if "--disable-sip" in argv or "--enable-sip" in argv:
+        is_on = "--enable-sip" in argv
+        if is_on == is_sip_on:
+            print(f"SIP is already {'on' if is_on else 'off'}")
+            return 0
+        if not is_on:
+            print(f"Turning SIP off: {SIP_COST}. csrutil asks y/n, an admin user "
+                  f"and that user's password.")
+        code = set_sip(is_on)
+        print(recovery_steps(is_on) if code else "restart the Mac for it to take effect")
+        return code
+
+    preset_name = ""
+    if "--preset" in argv:
+        i = argv.index("--preset")
+        if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+            print(f"--preset needs a name: {', '.join(BUILTIN_PRESETS)}, or a "
+                  f"file in {PRESETS_DIR}", file=sys.stderr)
+            return 1
+        preset_name = argv[i + 1]
+
+    if "--audit" in argv:
+        return cmd_audit(sections, absent, version_skip)
+    if "--status" in argv or "--verify" in argv:
+        return cmd_status(sections, as_json)
+    if "--list" in argv:
+        listed = sections
+        if preset_name:
+            preset = resolve_preset(sections, preset_name)
+            if preset is None:
+                print(f"unknown preset '{preset_name}'", file=sys.stderr)
+                return 1
+            if not any(sec.items for sec in preset):
+                print(f"preset '{preset_name}' lists no labels", file=sys.stderr)
+                return 1
+            listed = preset
+        print(format_labels(listed), end="")
+        return 0
+    if "--restore" in argv:
+        index = argv.index("--restore")
+        candidate = argv[index + 1] if index + 1 < len(argv) and not argv[index + 1].startswith("-") else None
+        return cmd_restore(sections, Path(candidate) if candidate else None)
+    if "--enable-all" in argv or "--disable-all" in argv:
+        refresh_state(sections)
+        want_enabled = "--enable-all" in argv
+        if not want_enabled:
+            print("--disable-all takes every label, including Apple ID auth, App "
+                  "Store, bridgeOS, and com.apple.campo: iCloud login, App Store "
+                  "purchases, macOS Update installs, and on macOS 27 Cmd-Space / "
+                  "the four-finger Apps pinch will break. `--preset balanced` "
+                  "keeps them.")
+        for sec in sections:
+            for it in sec.items:
+                it.selected = want_enabled
+        kept = keep_locked_on(sections)
+        if kept:
+            print(f"{kept} labels need SIP off and were left on (`debloat --disable-sip`)")
+        return run_apply(sections, dry_run)
+    if not preset_name and argv == ["--dry-run"]:
+        preset_name = EXTREME_PRESET
+    if preset_name:
+        return cmd_preset(sections, preset_name, dry_run)
+
+    print(source_note)
+    if absent:
+        print(f"skipped {len(absent)} labels not present on this macOS build "
+              f"(see `debloat --audit`)")
+    if version_skip:
+        print(f"skipped {len(version_skip)} labels gated to another macOS "
+              f"(see `debloat --audit`)")
+    if not reopen_tty_stdin():
+        print("交互界面需要终端；也可以使用 --preset、--dry-run、--status 等命令。", file=sys.stderr)
+        return 1
+    refresh_state(sections)
+    result = curses.wrapper(run_tui, sections)
+    if result:
+        print(result)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
