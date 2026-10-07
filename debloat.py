@@ -1676,7 +1676,10 @@ def run_apply(sections: list[Section], dry_run: bool) -> int:
     print(f"恢复快照：{snapshot}", flush=True)
     result = apply_changes(sections, retry_running=True)
     daemon_msg = sync_boot_daemon(sections)
-    (BACKUP_DIR / "last-apply.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
+    report_path = BACKUP_DIR / "last-apply.json"
+    report_path.write_text(json.dumps(result, ensure_ascii=False, indent=2))
+    if os.geteuid() == 0 and UID:
+        os.chown(report_path, UID, pwd.getpwuid(UID).pw_gid)
     print(f'处理完成：尝试禁用/停止 {result["disabled"]} 项，启用 {result["enabled"]} 项；停止进程 {result["killed"]} 个')
     if daemon_msg:
         print(daemon_msg)
