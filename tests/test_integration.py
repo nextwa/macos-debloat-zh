@@ -74,6 +74,7 @@ class IntegrationTest(base.FakeMachineTest):
     def test_retry_reports_already_disabled_running_service(self):
         label = 'com.example.already-disabled'
         self.machine.add(label, daemon_plist=True, registered=['system'], disabled=['system'], pid=998877)
+        self.machine.fail('bootout', 150, 'System Integrity Protection is engaged')
         secs, _ = self.sections(label)
         self.debloat.refresh_state(secs)
         # Exercise launchd state and retry selection without sending a process signal.

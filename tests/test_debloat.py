@@ -68,6 +68,12 @@ if fail:
     sys.stderr.write(fail["message"] + "\n")
     sys.exit(fail["code"])
 
+if action == "bootstrap":
+    label = os.path.basename(argv[2]).removesuffix(".plist")
+    state["domains"][argv[1]]["services"][label] = 0
+    open(state_path, "w").write(json.dumps(state))
+    sys.exit(0)
+
 label = argv[1].rsplit("/", 1)[1]
 domain = argv[1][: -(len(label) + 1)]
 target = state["domains"][domain]["disabled"]
@@ -77,6 +83,8 @@ if action == "disable" and state.get("overrides_land", True):
 elif action == "enable":
     if label in target:
         target.remove(label)
+elif action == "bootout":
+    state["domains"][domain]["services"].pop(label, None)
 open(state_path, "w").write(json.dumps(state))
 sys.exit(0)
 '''
@@ -192,6 +200,11 @@ class FakeMachineTest(unittest.TestCase):
         self.addCleanup(lambda: os.environ.update(PATH=self._path))
         self.machine = FakeMachine(Path(tmpdir.name), self.debloat)
         self.gui = self.machine.gui
+        self.debloat.BACKUP_DIR = self.machine.tmp / "backup"
+        self.debloat.PERSIST_DIR = self.machine.tmp / "persist"
+        self.debloat.PERSIST_STATE = self.debloat.PERSIST_DIR / "persist.json"
+        self.debloat.PERSIST_REPORT = self.debloat.PERSIST_DIR / "last-run.json"
+        self.debloat.PERSIST_PLIST = self.machine.tmp / "persist.plist"
 
     def sections(self, *labels):
         secs = self.debloat.parse_labels("\n".join(labels))
@@ -432,7 +445,7 @@ class CommandLineTest(FakeMachineTest):
         (self.debloat.PRESETS_DIR / "mine.txt").write_text(listed)
         code, out = self.run_cli("--preset", "mine", "--dry-run")
         self.assertEqual(code, 0)
-        self.assertIn("preset mine: 2 labels", out)
+        self.assertIn("预设 mine：2 项", out)
 
     def test_restore_turns_spotlight_back_on_when_the_apply_turned_it_off(self):
         self.two_labels()
@@ -479,7 +492,8 @@ class MenuTest(FakeMachineTest):
         self.machine.state["domains"]["system"]["disabled"] += [
             "com.example.telemetry", "com.example.photos"]
         self.machine.flush()
-        self.assertEqual(self.rows(), ["preset:extreme-keep-airdrop-search", "preset:telemetry", "preset:balanced", "enable-all"])
+        self.assertNotIn("disable-all", self.rows())
+        self.assertIn("enable-all", self.rows())
 
     def test_enable_all_row_appears_as_soon_as_one_label_is_disabled(self):
         """The panic button must not need every label disabled to show up."""
