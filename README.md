@@ -1,6 +1,6 @@
-# macOS 精简实验工具
+# macOS 内存与服务工具
 
-按项管理不用的 macOS 后台服务，分别查看禁用配置和实际运行状态，并按执行前快照恢复。提供中文终端界面、搜索与筛选、执行预览、逐项结果和内存/进程对比工具。
+查看内存压力及应用占用，请求应用释放可丢弃缓存，并记录前后变化。也可以按项管理 macOS 后台服务，区分禁用配置和实际运行状态，按执行前快照恢复。提供中文终端界面、搜索与筛选、执行预览及两类独立实验。
 
 以 [zhaoyangtop/macos-debloat](https://github.com/zhaoyangtop/macos-debloat) 的中文使用方式和服务分类为基础，整合 [OleksandrKrupko/mac-os-debloat](https://github.com/OleksandrKrupko/mac-os-debloat) 的 Python 服务管理、TUI、状态识别及开机保持功能。双方均为 MIT 许可证，版权声明见 [LICENSE](LICENSE)。
 
@@ -11,11 +11,39 @@ macOS 26 / 27，Python 3.9+。本机实验使用 Apple Silicon；其他系统版
 ```bash
 git clone https://github.com/nextwa/macos-debloat-zh.git
 cd macos-debloat-zh
-./macos_disable_bloat_services.sh --dry-run
+./macos_disable_bloat_services.sh --memory-ui
+# 打开服务管理界面
 ./macos_disable_bloat_services.sh
 ```
 
-也可以在 Finder 中双击 `启动精简工具.command` 打开终端界面。
+也可以在 Finder 中双击 `打开内存面板.command` 或 `启动精简工具.command`。
+
+## 内存面板与应用缓存回收
+
+内存面板显示压力级别、压缩器占用、Wired、文件缓存、交换空间，以及按应用汇总的内存足迹和 RSS。应用包内的 Helper 和可追溯父进程的子进程归入同组，无法归属的系统进程单列。
+
+| 按键 | 操作 |
+|---|---|
+| `↑` / `↓`、`j` / `k`、`PgUp` / `PgDn` | 移动应用列表 |
+| `/`、`r` | 搜索应用、刷新采样 |
+| 回车 | 查看所选应用的 PID、读数覆盖范围与应用路径 |
+| `o` | 预览缓存回收，按 `y` 确认后执行 |
+| `v` | 最近一次缓存回收结果 |
+| `Esc` / `q` | 返回或退出 |
+
+```bash
+./macos_disable_bloat_services.sh --memory
+./macos_disable_bloat_services.sh --memory --json
+./macos_disable_bloat_services.sh --reclaim-memory --dry-run
+./macos_disable_bloat_services.sh --reclaim-memory
+./macos_disable_bloat_services.sh --memory-report --json
+```
+
+回收操作使用 macOS 自带的 `memory_pressure -S -l warn -s 1`，模拟 1 秒的 warn 级别内存压力，让响应通知的应用释放可丢弃缓存。执行需要管理员认证。内存压力紧张或状态无法识别时会跳过；压力正常时允许手动实验，并说明收益可能很小。
+
+结果记录在 `~/Library/Application Support/macos-debloat-zh/last-memory.json`，包含前后分类数据、交换读写增量，以及按 PID 和启动时间匹配的同批进程足迹变化。内存操作独立于服务选择和开机保持配置。
+
+内存模块参考 [WonderBox](https://github.com/jasonwong1991/WonderBox) 的应用聚合与分类对比方式，以及 [mac-ram-cleaner](https://github.com/chumafox/mac-ram-cleaner) 的短时模拟压力方式；本项目使用 Python 标准库和 macOS 系统接口实现。指标含义见 [Apple 活动监视器说明](https://support.apple.com/guide/activity-monitor/view-memory-usage-actmntr1004/mac)。
 
 ## 交互界面
 
@@ -33,6 +61,7 @@ cd macos-debloat-zh
 | `/` | 按服务名称、中文分类或说明搜索 |
 | `f` | 切换全部、禁用仍运行、保留功能、待更改 |
 | `a` | 预览并应用当前选择 |
+| `m` | 打开内存面板，保留未执行的服务选择 |
 | `r` | 重新读取系统状态，清除未执行的选择 |
 | `v` / `?` | 最近结果、操作与 SIP 说明 |
 | `Esc` / `q` | 清空搜索筛选、退出 |
@@ -111,6 +140,16 @@ AirDrop 联系人模式需要身份与联系人信息，不能把这些共享依
 
 ## 内存与进程实验
 
+应用缓存回收实验：
+
+```bash
+python3 tools/memory_experiment.py --output reports/memory-run
+```
+
+程序先完成管理员认证，采集 10 秒无操作对照，再执行一次缓存回收，记录约 3 秒、30 秒和 120 秒后的变化，生成 JSON 原始数据和 `comparison.md`。正常使用当前应用即可；比较时应保持相同工作负载。
+
+服务精简实验：
+
 ```bash
 python3 tools/experiment.py capture --output reports/before.json
 ./macos_disable_bloat_services.sh --preset extreme-keep-airdrop-search --attempt-protected
@@ -139,10 +178,14 @@ SIP 拒绝卸载会单独列出服务和所属域。即使服务当时没有进�
 python3 -m unittest discover -s tests -v
 ```
 
-测试使用模拟 launchctl/mdutil，不操作真实系统服务。覆盖实际域识别、SIP 拒绝、逐项状态、跨域恢复、保留项开机重新启用、守护程序更新，以及交互预览取消不请求管理员权限、不修改服务。中文布局覆盖常见终端尺寸。
+测试使用模拟 launchctl/mdutil 和内存回收请求，不操作真实系统服务。覆盖实际域识别、SIP 拒绝、逐项状态、跨域恢复、保留项开机重新启用、守护程序更新、应用进程聚合、Apple Silicon 页大小、不可读足迹、交换写出及进程重启比较。两类交互预览取消均不请求管理员权限。中文布局覆盖常见终端尺寸。
 
 ## 已知限制
 
+- 应用是否释放缓存由其自身实现决定；通知成功不等于释放成功，也不能保证持续性能提升。
+- 足迹来自 `proc_pid_rusage` 的系统计费口径，不能与 RSS 混加。部分系统进程需要更高权限才能读取；`≥` 标记部分读数，不可读值不会当作零占用。
+- 共享 XPC 服务未必能归属到某个应用；进程分组不等于完整的系统资源归因。
+- 缓存可在继续使用后增长，交换活动和前台任务会影响结果。文件缓存减少或空闲页增加不能单独证明改善。
 - 关闭服务不会卸载应用、删除 AI 模型或清理用户数据。
 - 实际可关闭数量随 macOS 构建和 SIP 状态变化，服务目录数量不是成功数量。
 - Spotlight 索引保留，文件搜索和索引开销也随之保留。

@@ -1374,6 +1374,8 @@ def menu_section(sections: list[Section]) -> Section:
              comment=f"准备 {sizes['telemetry']} 项：统计、诊断、崩溃报告、广告及测试版计划。"),
         Item(label="均衡预设 · 包含关闭 AirDrop", section=MENU_SECTION, action="preset:balanced",
              comment=f"准备 {sizes['balanced']} 项：遥测、Siri、AI、信息和互通。需要 AirDrop 请用上面的保留预设。"),
+        Item(label="内存面板 · 应用占用与缓存回收", section=MENU_SECTION, action="memory",
+             comment="按应用合并辅助进程，查看内存压力、压缩与交换；可单独请求应用释放缓存。"),
     ]
     if not all(it.disabled for it in flat):
         items.append(Item(label="关闭整个目录 · 包含保留功能", section=MENU_SECTION,
@@ -1554,7 +1556,7 @@ def draw(stdscr, sections: list[Section], cursor: int, status: str, scroll: list
             put_line(stdscr, h - 5, current.label, curses.A_BOLD)
         put_line(stdscr, h - 4, about, curses.A_DIM)
     put_line(stdscr, h - 3, "↑↓ 移动  空格 选择  [ ] 分组  / 搜索  f 筛选  r 刷新")
-    put_line(stdscr, h - 2, "回车 选择/预览  a 应用  v 最近结果  ? 帮助  q 退出")
+    put_line(stdscr, h - 2, "回车 预览  a 应用  m 内存  v 结果  ? 帮助  q 退出")
     put_line(stdscr, h - 1, status or "[✓] 允许启动  [ ] 请求禁用  * 待更改；选择不等于执行结果。", curses.A_BOLD)
     stdscr.refresh()
 
@@ -1591,7 +1593,7 @@ def show_dialog(stdscr, title: str, lines: list[str], *, confirm: bool = False) 
             return False
 
 
-def read_search(stdscr, previous: str) -> str:
+def read_search(stdscr, previous: str, prompt: str = "搜索名称 / 分类 / 说明：") -> str:
     value = previous
     stdscr.timeout(-1)
     curses.curs_set(1)
@@ -1600,7 +1602,7 @@ def read_search(stdscr, previous: str) -> str:
             h, w = stdscr.getmaxyx()
             stdscr.move(h - 1, 0)
             stdscr.clrtoeol()
-            put_line(stdscr, h - 1, "搜索名称 / 分类 / 说明：" + value)
+            put_line(stdscr, h - 1, prompt + value)
             stdscr.refresh()
             key = stdscr.get_wch()
             if key in ('\n', '\r', curses.KEY_ENTER):
@@ -1709,6 +1711,8 @@ def run_tui(stdscr, sections: list[Section]) -> str | None:
             refresh_spotlight(spotlight)
             heading = overview()
             status = "已重新读取系统状态，未执行的选择已重置。"
+        elif key == ord('m'):
+            run_memory_tui(stdscr)
         elif key == ord(' ') and flat:
             it = flat[cursor]
             if it.is_locked and it.selected:
@@ -1717,6 +1721,9 @@ def run_tui(stdscr, sections: list[Section]) -> str | None:
                 it.selected = not it.selected
         elif key in (10, 13, curses.KEY_ENTER, ord('a'), ord('v'), ord('?')):
             action = 'apply' if key == ord('a') else 'report' if key == ord('v') else 'help' if key == ord('?') else flat[cursor].action if flat else ''
+            if action == 'memory':
+                run_memory_tui(stdscr)
+                continue
             if action.startswith('preset:') or action in ('disable-all', 'enable-all'):
                 status = select_for_action(sections, action)
                 if action == 'preset:' + EXTREME_PRESET:
@@ -1727,6 +1734,7 @@ def run_tui(stdscr, sections: list[Section]) -> str | None:
                     '空格修改选择；预设只准备计划。按 a 预览，再按 y 执行。',
                     '按 / 搜索服务、中文分类或说明；f 切换全部、禁用仍运行、保留功能、待更改。',
                     '按 r 重新读取系统，未执行的选择会重置。Esc 清空搜索与筛选。', '',
+                    '按 m 打开内存面板；在面板中按 o 预览应用缓存回收，按 v 查看回收结果。', '',
                     '已禁用·未运行：禁用配置已写入，当前没有运行进程。',
                     '禁用但仍运行：配置已写入，但进程仍在运行。',
                     '部分域仍禁用：同一服务在不同域中的配置不一致；[-] 保留当前各域状态。',
@@ -2282,7 +2290,145 @@ def cmd_preset(sections: list[Section], name: str, dry_run: bool) -> int:
     return run_apply(sections, dry_run)
 
 
-VERSION = "0.2.0"
+def run_memory_tui(stdscr) -> None:
+    import memory_tools as memory
+
+    def sample():
+        put_line(stdscr, 0, '正在读取内存与应用进程…', curses.A_BOLD)
+        stdscr.refresh()
+        return memory.capture()
+
+    cursor, query, status = 0, '', ''
+    try:
+        snapshot = sample()
+        while True:
+            rows = [r for r in snapshot['groups'] if query.casefold() in r['name'].casefold()]
+            cursor = max(0, min(cursor, len(rows) - 1))
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            stdscr.timeout(-1)
+            put_line(stdscr, 0, f'macOS 精简 {VERSION} · 内存与应用', curses.A_BOLD)
+            if h < 18 or w < 62:
+                put_line(stdscr, 2, '请将终端扩大到至少 62 列、18 行。按 q 返回。')
+            else:
+                m = snapshot['memory']
+                put_line(stdscr, 1, f"压力：{m['pressure']}  物理内存：{memory.mib(m['physical_memory_bytes'])}  进程：{snapshot['process_count']}")
+                put_line(stdscr, 2, f"压缩：{memory.mib(m['compressor_bytes'])}  Wired：{memory.mib(m['wired_bytes'])}  Swap：{memory.mib(m['swap_used_bytes'])}")
+                put_line(stdscr, 3, f"文件缓存：{memory.mib(m['file_backed_bytes'])}  空闲与推测页：{memory.mib(m['free_and_speculative_bytes'])}")
+                put_line(stdscr, 4, f"已读取 {snapshot['measured_count']} / {snapshot['process_count']} 个足迹  搜索：{query or '无'}", curses.A_DIM)
+                put_line(stdscr, 6, pad_text('应用 / 进程组', w - 33) + pad_text('内存足迹', 15) + pad_text('RSS', 12) + '进程', curses.A_DIM)
+                height = h - 11
+                start = max(0, cursor - height + 1)
+                for i, row in enumerate(rows[start:start + height]):
+                    name = pad_text(clip_text(row['name'], w - 35), w - 33)
+                    text = name + pad_text(memory.footprint_text(row), 15) + pad_text(memory.mib(row['rss_bytes']), 12) + str(row['process_count'])
+                    put_line(stdscr, 7 + i, text, curses.A_REVERSE if start + i == cursor else 0)
+                if not rows:
+                    put_line(stdscr, 7, '没有匹配项。按 / 修改搜索。')
+                put_line(stdscr, h - 3, '↑↓ 移动  / 搜索  r 刷新  o 缓存回收  v 结果  q 返回')
+                put_line(stdscr, h - 2, '足迹与 RSS 不混加；≥ 为部分进程读数。回车查看所选项。', curses.A_DIM)
+                put_line(stdscr, h - 1, status or '应用及其 Helper 合并展示；无法归属的系统进程单列。')
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key in (27, ord('q')):
+                return
+            if key in (curses.KEY_DOWN, ord('j')):
+                cursor += 1
+            elif key in (curses.KEY_UP, ord('k')):
+                cursor -= 1
+            elif key in (curses.KEY_NPAGE, curses.KEY_PPAGE):
+                cursor += 10 if key == curses.KEY_NPAGE else -10
+            elif key == ord('/'):
+                query, cursor = read_search(stdscr, query, '搜索应用 / 进程：'), 0
+            elif key == ord('r'):
+                snapshot, status = sample(), '已刷新。'
+            elif key == ord('v'):
+                path = BACKUP_DIR / 'last-memory.json'
+                lines = memory.report_lines(json.loads(path.read_text())) if path.exists() else ['尚无缓存回收记录。']
+                show_dialog(stdscr, '最近缓存回收结果', lines)
+            elif key in (10, 13, curses.KEY_ENTER) and rows:
+                row = rows[cursor]
+                show_dialog(stdscr, row['name'], [
+                    f"内存足迹：{memory.footprint_text(row)}；RSS：{memory.mib(row['rss_bytes'])}",
+                    f"进程数：{row['process_count']}；足迹可读：{row['measured_count']}",
+                    'PID：' + ', '.join(map(str, row['pids'])),
+                    '应用/进程组：' + row['id'], '',
+                    '需要退出闲置应用时，请先保存工作，再在该应用中按 ⌘Q。',
+                ])
+            elif key == ord('o'):
+                snapshot = sample()
+                plan = memory.reclaim_plan(snapshot)
+                if not plan['allowed']:
+                    status = plan['reason']
+                    continue
+                if not show_dialog(stdscr, '应用缓存回收预览', [
+                    plan['reason'],
+                    '向应用发送 1 秒 warn 级别模拟内存压力，请应用释放可丢弃缓存。',
+                    '完成后记录内存、交换活动和应用足迹的实际变化。',
+                    '正在使用的应用数据仍会保留；可回收多少取决于应用响应。',
+                ], confirm=True):
+                    status = '已取消。'
+                    continue
+                if not authenticate(stdscr):
+                    status = '管理员认证未完成。'
+                    continue
+                put_line(stdscr, 0, '正在请求回收并记录结果…', curses.A_BOLD)
+                stdscr.refresh()
+                result = memory.reclaim(BACKUP_DIR)
+                show_dialog(stdscr, '缓存回收结果', memory.report_lines(result))
+                snapshot = result.get('after', result['before'])
+                status = '结果已保存，按 v 查看。'
+    except (OSError, RuntimeError, ValueError) as exc:
+        show_dialog(stdscr, '内存操作未完成', [str(exc)])
+
+
+def cmd_memory(argv: list[str]) -> int:
+    import memory_tools as memory
+
+    actions = {'--memory', '--memory-ui', '--reclaim-memory', '--memory-report'}
+    if len(actions.intersection(argv)) != 1 or any(arg not in actions | {'--json', '--dry-run'} for arg in argv):
+        print('内存命令请单独使用：--memory、--memory-ui、--reclaim-memory 或 --memory-report。', file=sys.stderr)
+        return 1
+    if '--dry-run' in argv and '--reclaim-memory' not in argv:
+        print('--dry-run 在内存命令中仅用于 --reclaim-memory。', file=sys.stderr)
+        return 1
+    as_json = '--json' in argv
+    try:
+        if '--memory-ui' in argv:
+            if as_json or not reopen_tty_stdin():
+                print('内存面板需要终端；JSON 查询请使用 --memory --json。', file=sys.stderr)
+                return 1
+            curses.wrapper(run_memory_tui)
+            return 0
+        if '--memory-report' in argv:
+            path = BACKUP_DIR / 'last-memory.json'
+            if not path.exists():
+                print('尚无缓存回收记录。', file=sys.stderr)
+                return 1
+            data = json.loads(path.read_text())
+            lines = memory.report_lines(data)
+        else:
+            data = memory.capture()
+            lines = memory.snapshot_lines(data)
+            if '--reclaim-memory' in argv:
+                plan = memory.reclaim_plan(data)
+                if '--dry-run' in argv:
+                    data = {'status': 'preview', 'before': data, 'plan': plan}
+                    lines += ['', plan['reason'], '计划：' + ' '.join(plan.get('command', []))]
+                else:
+                    if plan['allowed'] and not prime_sudo():
+                        print('管理员认证未完成，未发送回收通知。', file=sys.stderr)
+                        return 2
+                    data = memory.reclaim(BACKUP_DIR)
+                    lines = memory.report_lines(data)
+        print(json.dumps(data, ensure_ascii=False, indent=2) if as_json else '\n'.join(lines))
+        return 2 if data.get('status') in ('failed', 'skipped') else 0
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f'内存操作未完成：{exc}', file=sys.stderr)
+        return 2
+
+
+VERSION = "0.3.0"
 
 
 def help_text() -> str:
@@ -2300,6 +2446,10 @@ def help_text() -> str:
   --attempt-protected                 对 SIP 标记项目也尝试一次，结果可能被系统拒绝
   --status / --verify [--json]         逐项配置、运行状态、PID 与所属域
   --report [--json]                   最近执行结果和逐项失败原因
+  --memory [--json]                   内存压力、应用及辅助进程内存足迹
+  --memory-ui                        直接打开中文内存面板
+  --reclaim-memory [--dry-run]        请求应用释放缓存，保存前后实测结果
+  --memory-report [--json]            最近缓存回收结果
   --list / --audit                     服务清单 / 不存在或不适用的服务
   --restore [快照.json]                恢复最近一次或指定快照的各域状态
   --enable-all                        启用整个目录，移除开机保持程序
@@ -2321,6 +2471,8 @@ def main() -> int:
         return 0
     if Path(__file__).resolve() == PERSIST_DIR / "debloat.py":
         return cmd_persist_run()
+    if any(arg in argv for arg in ('--memory', '--memory-ui', '--reclaim-memory', '--memory-report')):
+        return cmd_memory(argv)
     options = {"--preset", "--dry-run", "--attempt-protected", "--status", "--verify", "--json",
                "--list", "--audit", "--restore", "--enable-all", "--disable-all", "--report",
                "--disable-sip", "--enable-sip"}
